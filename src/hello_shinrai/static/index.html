@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A local playground for ShinrAI protection, chat, and API debugging.">
+  <meta name="hello-shinrai-session" content="__SESSION_TOKEN__">
+  <title>Hello ShinrAI</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Hello ShinrAI home">
+      <span class="brand-mark" aria-hidden="true">信</span>
+      <span><strong>Hello Shinr<span class="brand-ai">AI</span></strong><small>local protection workbench</small></span>
+    </a>
+    <div class="connection-strip">
+      <span class="connection-chip" id="shinrai-connection-chip"><span class="status-dot"></span><span id="shinrai-connection-label">ShinrAI · not connected</span></span>
+      <span class="connection-chip" id="llm-connection-chip"><span class="status-dot"></span><span id="llm-connection-label">LLM · not configured</span></span>
+      <button class="button quiet" id="open-settings" type="button">Connections</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="rail" aria-label="Workbench tools">
+      <button class="rail-item active" data-tab="text" type="button"><span>01</span>Text</button>
+      <button class="rail-item" data-tab="files" type="button"><span>02</span>Files</button>
+      <button class="rail-item" data-tab="chat" type="button"><span>03</span>Chat</button>
+      <button class="rail-item" data-tab="azure" type="button"><span>04</span>Azure compare</button>
+      <button class="rail-item" data-tab="explorer" type="button"><span>05</span>API explorer</button>
+      <div class="rail-note">Keys and conversation content stay in this process unless you export them.</div>
+    </nav>
+
+    <main class="workspace">
+      <section class="panel active" id="panel-text" aria-labelledby="tab-text-title">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Start here</p><h1 id="tab-text-title">See protection happen</h1><p>Detect personal data or replace it with useful stand-ins.</p></div>
+          <span class="step-badge">ShinrAI key only</span>
+        </div>
+        <form id="text-form" class="surface">
+          <div class="field-row three">
+            <label>Operation<select id="text-operation"><option value="redact">Protect text</option><option value="analyze">Detect only</option><option value="batch">Consistent batch</option></select></label>
+            <label>Mode<select id="text-mode"><option value="replace">Replace &amp; restore</option><option value="mask">Mask</option><option value="label">Label</option></select></label>
+            <label>Tier<select id="text-tier"><option value="standard">Standard</option><option value="batch">Batch</option><option value="realtime">Real-time · fast</option></select></label>
+          </div>
+          <label class="block-label">Input<textarea id="text-input" rows="8">Please send the contract to Ada Lovelace at ada@example.org. Her office is at 12 Analytical Engine Way, London.</textarea></label>
+          <p class="hint" id="batch-hint">For a batch, separate texts with a line containing <code>---</code>.</p>
+          <details class="advanced"><summary>Model and detection options</summary><div class="field-row two"><label>ShinrAI model<input id="text-model" value="shinrai-latest"></label><label>Threshold <output id="threshold-value">0.70</output><input id="text-threshold" type="range" min="0" max="1" step="0.05" value="0.7"></label></div></details>
+          <div class="actions"><button class="button primary" type="submit">Run protection</button><button class="button quiet" id="use-simple-example" type="button">Reset example</button><span class="run-status" id="text-status"></span></div>
+        </form>
+        <div class="result-grid hidden" id="text-result"><article class="surface result-card"><p class="eyebrow">Original with findings</p><div id="text-original" class="prose-output highlighted-output"></div></article><article class="surface result-card"><p class="eyebrow">Protected output</p><div id="text-output" class="prose-output"></div></article><article class="surface result-card"><p class="eyebrow">Findings and usage</p><pre id="text-json"></pre></article></div>
+      </section>
+
+      <section class="panel" id="panel-files" aria-labelledby="tab-files-title">
+        <div class="panel-heading"><div><p class="eyebrow">Documents and scans</p><h1 id="tab-files-title">Protect a file</h1><p>TXT, PDF, DOCX, PNG, JPEG, and BMP. Nothing goes to an LLM yet.</p></div><span class="step-badge">10 MB maximum</span></div>
+        <form id="file-form" class="surface upload-surface">
+          <label class="dropzone" id="dropzone"><input id="file-input" type="file" accept=".txt,.pdf,.docx,.png,.jpg,.jpeg,.bmp" required><span class="drop-icon">＋</span><strong>Choose a file</strong><small>or drop it here</small></label>
+          <div class="field-row two"><label>Protection mode<select id="file-mode"><option value="replace">Replace</option><option value="mask">Mask</option><option value="label">Label</option></select></label><div class="actions align-end"><button class="button primary" type="submit">Protect file</button><span class="run-status" id="file-status"></span></div></div>
+        </form>
+        <div id="attachment-list" class="attachment-list"></div>
+      </section>
+
+      <section class="panel" id="panel-chat" aria-labelledby="tab-chat-title">
+        <div class="panel-heading"><div><p class="eyebrow">Protected LLM chat</p><h1 id="tab-chat-title">Chat through ShinrAI</h1><p>Inspect the protected prompt, provider reply, and locally restored answer.</p></div><button class="button quiet" id="clear-chat" type="button">New conversation</button></div>
+        <div class="chat-layout">
+          <div class="surface chat-card">
+            <div id="chat-messages" class="messages"><div class="empty-state">Connect an LLM, then send a message. Attachments from the Files tab can be included below.</div></div>
+            <form id="chat-form" class="composer">
+              <label class="sr-only" for="chat-input">Message</label><textarea id="chat-input" rows="3" placeholder="Ask about your protected text…" required></textarea>
+              <div id="chat-attachments" class="check-list"></div>
+              <div class="composer-options">
+                <label><input id="chat-visuals" type="checkbox"> Send protected visuals</label>
+                <label id="vision-confirm-wrap" class="hidden"><input id="vision-confirm" type="checkbox"> I selected a vision-capable model</label>
+                <label><input id="chat-stream" type="checkbox" checked> Stream reply</label>
+                <select id="chat-tier" aria-label="ShinrAI tier"><option value="realtime">Real-time · fast</option><option value="standard">Standard</option><option value="batch">Batch</option></select>
+              </div>
+              <div class="actions"><button class="button primary" id="send-chat" type="submit">Send protected</button><button class="button danger hidden" id="stop-chat" type="button">Stop</button><span class="run-status" id="chat-status"></span></div>
+            </form>
+          </div>
+          <aside class="surface flow-card"><p class="eyebrow">What leaves your computer</p><ol><li>Your message goes to ShinrAI.</li><li>Only protected text and visuals go to the LLM.</li><li>The LLM replies with replacements.</li><li>Original values are restored here.</li></ol><p class="notice">Visual protection covers detected text. It does not hide faces, barcodes, or non-text identifiers.</p></aside>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-azure" aria-labelledby="tab-azure-title">
+        <div class="panel-heading"><div><p class="eyebrow">Migration lab</p><h1 id="tab-azure-title">Azure Language comparison</h1><p>Run the same Azure-shaped request against ShinrAI and, optionally, your Azure resource.</p></div><span class="step-badge">No accuracy claim</span></div>
+        <form id="azure-form" class="surface">
+          <div class="field-row two"><label>Contract<select id="azure-path"><option value="/language/:analyze-text">2026 Analyze Text</option><option value="/text/analytics/v3.1/entities/recognition/pii">Legacy v3.1</option></select></label><label><span>Comparison</span><span class="inline-check"><input id="azure-real" type="checkbox"> Include saved Azure resource</span></label></div>
+          <label class="block-label">Request body<textarea id="azure-body" class="code-input" rows="15"></textarea></label>
+          <div class="actions"><button class="button primary" type="submit">Run comparison</button><span class="run-status" id="azure-status"></span></div>
+        </form>
+        <div class="comparison-grid" id="azure-results"></div>
+      </section>
+
+      <section class="panel" id="panel-explorer" aria-labelledby="tab-explorer-title">
+        <div class="panel-heading"><div><p class="eyebrow">Admin workbench</p><h1 id="tab-explorer-title">API explorer</h1><p>Only reviewed processing routes and safe routes discovered from OpenAPI are callable.</p></div><span class="step-badge">No automatic retry</span></div>
+        <form id="explorer-form" class="surface">
+          <label class="block-label">Operation<select id="explorer-operation"></select></label>
+          <div class="operation-meta" id="operation-meta"></div>
+          <div id="discovered-fields" class="field-row two hidden"><label>Method<select id="explorer-method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label><label>Discovered path<select id="explorer-path"></select></label></div>
+          <label class="block-label">Request path<input id="explorer-request-path" spellcheck="false"></label>
+          <label class="block-label">Query parameters (JSON)<textarea id="explorer-query" class="code-input" rows="3">{}</textarea></label>
+          <label class="block-label">Request body (JSON)<textarea id="explorer-body" class="code-input" rows="13"></textarea></label>
+          <div class="actions"><button class="button primary" type="submit">Send once</button><button class="button quiet" id="explorer-download" type="button">Download response</button><span class="run-status" id="explorer-status"></span></div>
+        </form>
+        <article class="surface result-card hidden" id="explorer-result"><p class="eyebrow">Response</p><pre id="explorer-json"></pre></article>
+      </section>
+    </main>
+
+    <aside class="debug-panel" aria-label="Request debugger">
+      <div class="debug-heading"><div><p class="eyebrow">Transparent debugging</p><h2>Trace</h2></div><button class="icon-button" id="toggle-debug" type="button" aria-label="Collapse debugger">›</button></div>
+      <div class="debug-summary"><span id="trace-count">0 runs</span><span id="last-time">No timing yet</span></div>
+      <div id="trace-list" class="trace-list"><div class="empty-state">Your requests will appear here with each stage and timing.</div></div>
+      <div class="debug-actions"><button class="button quiet" id="export-safe" type="button">Export safe</button><button class="button quiet" id="export-full" type="button">Export with private data</button><button class="button quiet" id="clear-traces" type="button">Clear</button></div>
+    </aside>
+  </div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="dialog-heading"><div><p class="eyebrow">Local connections</p><h2>Connect services</h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></form>
+    <div class="settings-grid">
+      <form id="shinrai-settings" class="surface settings-card">
+        <div class="settings-card-heading"><div><span class="step-number">1</span><h3>ShinrAI</h3></div><span class="readiness" id="shinrai-card-status">Not connected</span></div>
+        <p>Required for every protection tool.</p>
+        <label>Base URL<input id="shinrai-url" value="https://api.shinrai.innovius.io" required></label>
+        <label>API key<input id="shinrai-key" type="password" autocomplete="off" placeholder="Use saved key"></label>
+        <div class="settings-actions"><label class="inline-check"><input id="remember-shinrai" type="checkbox"> Remember securely</label><button class="button primary" type="submit">Connect ShinrAI</button></div>
+        <div id="capability-card" class="capability-card"></div>
+      </form>
+      <form id="llm-settings" class="surface settings-card">
+        <div class="settings-card-heading"><div><span class="step-number">2</span><h3>LLM provider</h3></div><span class="readiness" id="llm-card-status">Not configured</span></div>
+        <p>Needed only for Chat.</p>
+        <div class="field-row two compact-fields"><label>Provider<select id="llm-provider"><option value="innovius">Innovius</option><option value="openai">OpenAI</option><option value="kie">Kie</option><option value="custom">Custom</option></select></label><label>API shape<select id="llm-protocol"><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
+        <label>Models URL<input id="llm-models-url"></label>
+        <label>Inference URL<input id="llm-inference-url"></label>
+        <label>API key<input id="llm-key" type="password" autocomplete="off" placeholder="Use saved key"></label>
+        <div class="model-row"><label>Model<input id="llm-model" list="model-options" placeholder="Enter or load a model"></label><button class="button quiet" id="load-models" type="button">Load models</button></div>
+        <datalist id="model-options"></datalist>
+        <div class="model-status-row"><span class="model-count" id="model-count">Models not loaded</span><span class="hint" id="model-note">Catalogue availability does not verify Responses or vision support.</span></div>
+        <div class="settings-actions"><label class="inline-check"><input id="remember-llm" type="checkbox"> Remember securely</label><button class="button primary" type="submit">Save LLM</button></div>
+      </form>
+      <details class="surface optional-settings">
+        <summary><span><strong>Optional Azure reference</strong><small>For side-by-side comparisons</small></span><span class="readiness" id="azure-card-status">Not configured</span></summary>
+        <form id="azure-settings" class="optional-settings-form"><div class="field-row two"><label>Azure endpoint<input id="azure-url" placeholder="https://your-resource.cognitiveservices.azure.com"></label><label>Azure key<input id="azure-key" type="password" autocomplete="off" placeholder="Use saved key"></label></div><div class="settings-actions"><label class="inline-check"><input id="remember-azure" type="checkbox"> Remember securely</label><button class="button primary" type="submit">Save Azure</button></div></form>
+      </details>
+    </div>
+    <div class="dialog-footer"><span id="secure-storage-note"></span><button class="button danger" id="forget-secrets" type="button">Forget all saved keys</button></div>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
