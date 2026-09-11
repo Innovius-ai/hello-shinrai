@@ -664,7 +664,14 @@ async def run_chat(app: FastAPI, body: ChatRun):
             provider_response=provider_body,
             restored_response=restored_text,
         )
-        yield event("complete", trace=trace, total_ms=total_ms, first_token_ms=first_token_ms)
+        yield event(
+            "complete",
+            trace=trace,
+            provider_reply=provider_text,
+            restored_reply=restored_text,
+            total_ms=total_ms,
+            first_token_ms=first_token_ms,
+        )
     except asyncio.CancelledError:
         trace.update(status="cancelled", error="The browser stopped the request; the upstream connection was closed.")
         raise
@@ -761,7 +768,12 @@ async def explorer_request(app, operation, method, path, query, payload, auth) -
         headers["x-goog-api-key"] = state.connection.shinrai_key
     client = configured_shinrai(app)
     return await client.request(
-        method, path, params=query, json=payload if payload is not None else None, headers=headers
+        method,
+        path,
+        params=query,
+        json=payload if payload is not None else None,
+        headers=headers,
+        bearer_auth=auth == "bearer",
     )
 
 

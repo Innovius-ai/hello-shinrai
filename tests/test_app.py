@@ -97,9 +97,11 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"output_text": "Response for [PERSON_1].", "usage": {"total_tokens": 7}})
     if request.url.path in {"/language/:analyze-text", "/text/analytics/v3.1/entities/recognition/pii"}:
         assert request.headers.get("ocp-apim-subscription-key")
+        assert request.headers.get("authorization") is None
         return httpx.Response(200, json={"provider": request.url.host, "results": {"documents": []}})
     if request.url.path.endswith("/content:inspect"):
         assert request.headers.get("x-goog-api-key") == "shinrai-secret"
+        assert request.headers.get("authorization") is None
         return httpx.Response(200, json={"result": {"findings": []}})
     if request.url.path == "/" and request.method == "POST":
         assert request.headers.get("x-amz-target") == "Comprehend_20171127.DetectPiiEntities"

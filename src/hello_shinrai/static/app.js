@@ -1,4 +1,4 @@
-const token = document.querySelector('meta[name="hello-shinrai-session"]').content;
+let token = document.querySelector('meta[name="hello-shinrai-session"]').content;
 const state = {
   bootstrap: null, traces: [], attachments: [], catalog: [], routes: [], chatController: null,
   connection: { shinrai: "offline", llm: false, azure: false, modelCount: null },
@@ -6,14 +6,25 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
-  const headers = new Headers(options.headers || {});
+  const requestOptions = { ...options };
+  const sessionRetry = requestOptions._sessionRetry === true;
+  delete requestOptions._sessionRetry;
+  const headers = new Headers(requestOptions.headers || {});
   headers.set("X-Hello-Shinrai-Session", token);
-  if (options.json !== undefined) {
+  if (requestOptions.json !== undefined) {
     headers.set("Content-Type", "application/json");
-    options.body = JSON.stringify(options.json);
-    delete options.json;
+    requestOptions.body = JSON.stringify(requestOptions.json);
+    delete requestOptions.json;
   }
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(path, { ...requestOptions, headers });
+  if (response.status === 403 && !sessionRetry) {
+    let detail = "";
+    try { detail = (await response.clone().json()).detail; } catch (_) {}
+    if (detail === "The local session token is missing or expired. Reload the page." && await renewLocalSession()) {
+      // The local guard rejected this before the operation ran, so one retry cannot duplicate a billable request.
+      return api(path, { ...options, _sessionRetry: true });
+    }
+  }
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try {
@@ -23,6 +34,21 @@ async function api(path, options = {}) {
     throw new Error(message);
   }
   return response;
+}
+
+async function renewLocalSession() {
+  try {
+    const page = await fetch(`/?session-refresh=${Date.now()}`, { cache: "no-store" });
+    if (!page.ok) return false;
+    const html = await page.text();
+    const documentCopy = new DOMParser().parseFromString(html, "text/html");
+    const fresh = documentCopy.querySelector('meta[name="hello-shinrai-session"]')?.content;
+    if (!fresh) return false;
+    token = fresh;
+    document.querySelector('meta[name="hello-shinrai-session"]').content = fresh;
+    toast("Local session renewed after the app restarted.");
+    return true;
+  } catch (_) { return false; }
 }
 
 async function jsonApi(path, options = {}) { return (await api(path, options)).json(); }
@@ -192,13 +218,18 @@ $("text-threshold").addEventListener("input", () => $("threshold-value").textCon
 $("use-simple-example").addEventListener("click", () => $("text-input").value = "Please send the contract to Ada Lovelace at ada@example.org. Her office is at 12 Analytical Engine Way, London.");
 function highlightFindings(text, entities = []) {
   const characters = [...text];
-  const usable = entities.filter((item) => Number.isInteger(item.offset) && Number.isInteger(item.length) && item.offset >= 0 && item.length > 0 && item.offset + item.length <= characters.length).sort((a, b) => a.offset - b.offset);
+  const usable = entities.map((item) => {
+    const offset = Number.isInteger(item.offset) ? item.offset : item.startIndex;
+    const length = Number.isInteger(item.length) ? item.length : Number.isInteger(item.endIndex) ? item.endIndex - offset : null;
+    return { ...item, offset, length };
+  }).filter((item) => Number.isInteger(item.offset) && Number.isInteger(item.length) && item.offset >= 0 && item.length > 0 && item.offset + item.length <= characters.length).sort((a, b) => a.offset - b.offset);
   let cursor = 0; const output = [];
   for (const item of usable) {
     if (item.offset < cursor) continue;
     output.push(escapeHtml(characters.slice(cursor, item.offset).join("")));
     const label = item.category || item.type || item.label || "finding";
-    const score = typeof item.confidence_score === "number" ? ` · ${item.confidence_score.toFixed(2)}` : typeof item.score === "number" ? ` · ${item.score.toFixed(2)}` : "";
+    const confidence = item.confidence_score ?? item.confidence ?? item.score;
+    const score = typeof confidence === "number" ? ` · ${confidence.toFixed(2)}` : "";
     output.push(`<mark title="${escapeHtml(label + score)}">${escapeHtml(characters.slice(item.offset, item.offset + item.length).join(""))}<small>${escapeHtml(label)}</small></mark>`);
     cursor = item.offset + item.length;
   }

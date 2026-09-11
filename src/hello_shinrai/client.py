@@ -63,7 +63,10 @@ class ShinraiClient:
             or path.startswith(("/console", "/ops", "/oauth", "/mcp"))
         ):
             raise ValueError("Unsupported ShinrAI path.")
-        headers = {"Authorization": "Bearer " + self.key, **kwargs.pop("headers", {})}
+        bearer_auth = kwargs.pop("bearer_auth", True)
+        headers = kwargs.pop("headers", {})
+        if bearer_auth:
+            headers = {"Authorization": "Bearer " + self.key, **headers}
         started = time.perf_counter()
 
         async def send(client: httpx.AsyncClient) -> httpx.Response:
