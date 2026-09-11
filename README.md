@@ -9,13 +9,13 @@ The app binds only to `127.0.0.1`. API keys remain in the local Python process u
 Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) once, then run the tagged release:
 
 ```bash
-uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.1/hello_shinrai-0.1.1-py3-none-any.whl hello-shinrai
+uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.2/hello_shinrai-0.1.2-py3-none-any.whl hello-shinrai
 ```
 
 The browser opens at `http://127.0.0.1:8765`. Use another port or skip browser opening when needed:
 
 ```bash
-uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.1/hello_shinrai-0.1.1-py3-none-any.whl hello-shinrai --port 8877 --no-browser
+uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.2/hello_shinrai-0.1.2-py3-none-any.whl hello-shinrai --port 8877 --no-browser
 ```
 
 To upgrade, change both version values in the wheel URL. To run the current development branch, use `uvx --from git+https://github.com/Innovius-ai/hello-shinrai hello-shinrai`.
@@ -41,7 +41,7 @@ docker run --rm -p 127.0.0.1:8765:8765 hello-shinrai
 After a tagged release, the same image is available from GitHub Container Registry:
 
 ```bash
-docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/innovius-ai/hello-shinrai:v0.1.1
+docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/innovius-ai/hello-shinrai:v0.1.2
 ```
 
 ## First request
