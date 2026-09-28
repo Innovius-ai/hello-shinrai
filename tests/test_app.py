@@ -42,7 +42,7 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"balances": {"available_records": 42.5}, "plan": "starter"})
     if request.url.path == "/openapi.json":
         return httpx.Response(200, json={"paths": {"/v1/analyze": {"post": {}}, "/console/account": {"get": {}}}})
-    if request.url.path == "/providers/aws/credentials":
+    if request.url.path in {"/providers/aws/credentials", "/v1/aws/providers/aws/credentials"}:
         return httpx.Response(
             200,
             json={
@@ -95,7 +95,7 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         assert "Ada Lovelace" not in flattened
         assert "[PERSON_1]" in flattened
         return httpx.Response(200, json={"output_text": "Response for [PERSON_1].", "usage": {"total_tokens": 7}})
-    if request.url.path in {"/language/:analyze-text", "/text/analytics/v3.1/entities/recognition/pii"}:
+    if request.url.path.removeprefix("/v1/azure") in {"/language/:analyze-text", "/text/analytics/v3.1/entities/recognition/pii"}:
         assert request.headers.get("ocp-apim-subscription-key")
         assert request.headers.get("authorization") is None
         return httpx.Response(200, json={"provider": request.url.host, "results": {"documents": []}})
@@ -103,7 +103,7 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         assert request.headers.get("x-goog-api-key") == "shinrai-secret"
         assert request.headers.get("authorization") is None
         return httpx.Response(200, json={"result": {"findings": []}})
-    if request.url.path == "/" and request.method == "POST":
+    if request.url.path in {"/", "/v1/aws/"} and request.method == "POST":
         assert request.headers.get("x-amz-target") == "Comprehend_20171127.DetectPiiEntities"
         assert request.headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
         return httpx.Response(200, json={"Entities": []})

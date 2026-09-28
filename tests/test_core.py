@@ -110,3 +110,16 @@ def test_unavailable_keyring_falls_back_to_session_only(monkeypatch):
     assert credentials.available() is False
     assert credentials.write("shinrai", "secret") is False
     assert credentials.read("shinrai") == ""
+
+
+
+def test_vendor_calls_use_the_v1_vendor_prefix():
+    from hello_shinrai.client import vendor_path
+
+    assert vendor_path("/language/:analyze-text") == "/v1/azure/language/:analyze-text"
+    assert vendor_path("/text/analytics/v3.1/entities/recognition/pii") == "/v1/azure/text/analytics/v3.1/entities/recognition/pii"
+    assert vendor_path("/v2/projects/hello/locations/global/content:inspect") == "/v1/google/v2/projects/hello/locations/global/content:inspect"
+    assert vendor_path("/v2/infoTypes") == "/v1/google/v2/infoTypes"
+    assert vendor_path("/providers/aws/credentials") == "/v1/aws/providers/aws/credentials"
+    assert vendor_path("/v2/detect") == "/v2/detect" and vendor_path("/v1/analyze") == "/v1/analyze"
+    assert vendor_path("/v1/azure/language/:analyze-text") == "/v1/azure/language/:analyze-text"

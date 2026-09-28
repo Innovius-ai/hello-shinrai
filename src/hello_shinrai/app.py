@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .catalog import BY_ID, public_catalog, template_matches
-from .client import RemoteError, Result, ShinraiClient, compact_json, render_pdf, response_body
+from .client import RemoteError, Result, ShinraiClient, compact_json, render_pdf, response_body, vendor_path
 from .restore import Restorer, restore
 from .security import sanitize, validate_base_url
 from .state import Attachment, RuntimeState
@@ -402,7 +402,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         query = {"api-version": body.api_version} if body.path.startswith("/language/") else {}
         calls = [
             call_azure(
-                app, state.connection.shinrai_url, state.connection.shinrai_key, body.path, query, body.body, "ShinrAI"
+                app, state.connection.shinrai_url, state.connection.shinrai_key, vendor_path(body.path), query, body.body, "ShinrAI"
             )
         ]
         if body.include_real_azure:
@@ -457,7 +457,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             raise HTTPException(404, "Explorer operation was not found.")
         trace = make_trace(
             "explorer." + body.operation_id,
-            destination=state.connection.shinrai_url + path,
+            destination=state.connection.shinrai_url + vendor_path(path),
             request={"query": query, "body": payload},
             status="running",
         )
@@ -788,7 +788,7 @@ async def aws_request(app, operation, payload) -> Result:
     if not access or not secret:
         raise RemoteError("ShinrAI did not issue valid AWS SDK credentials.")
     body = compact_json(payload)
-    url = state.connection.shinrai_url + "/"
+    url = state.connection.shinrai_url + "/v1/aws/"  # SigV4 signs this path; the gateway verifies it
     request = AWSRequest(
         method="POST",
         url=url,
@@ -937,9 +937,9 @@ def get_attachment(state, identifier):
 
 
 def auth_for_path(path: str) -> str:
-    if path.startswith(("/language/", "/text/analytics/")):
+    if path.startswith(("/language/", "/text/analytics/", "/v1/azure/")):
         return "azure"
-    if path.startswith("/v2/"):
+    if path.startswith(("/v2/projects/", "/v2/organizations/", "/v2/locations/", "/v2/infoTypes", "/v1/google/")):
         return "google"
     return "bearer"
 

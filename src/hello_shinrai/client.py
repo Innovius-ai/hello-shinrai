@@ -15,6 +15,27 @@ from PIL import Image, UnidentifiedImageError
 from .security import validate_base_url
 
 
+VENDOR_GOOGLE = ("/v2/projects/", "/v2/organizations/", "/v2/locations/", "/v2/infoTypes")
+
+
+def vendor_path(path: str) -> str:
+    """Vendor compatibility calls go through /v1/<vendor> on the ShinrAI API host.
+
+    The hosted API serves the Azure, Google and AWS contracts under these prefixes (the vendor
+    hosts azure/google/aws.api.shinrai.innovius.io serve them at the vendor's own paths); every
+    ShinrAI deployment, offline included, accepts the prefix.
+    """
+    if path.startswith(("/v1/azure/", "/v1/google/", "/v1/aws/")) or path == "/v1/aws":
+        return path
+    if path.startswith(("/language/", "/text/analytics/")):
+        return "/v1/azure" + path
+    if path.startswith(VENDOR_GOOGLE):
+        return "/v1/google" + path
+    if path.startswith("/providers/aws/"):
+        return "/v1/aws" + path
+    return path
+
+
 class RemoteError(RuntimeError):
     def __init__(self, message: str, *, status: int = 0, body: Any = None):
         super().__init__(message)
@@ -56,6 +77,7 @@ class ShinraiClient:
         self.http = http
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Result:
+        path = vendor_path(path) if path.startswith("/") else path
         if (
             not path.startswith("/")
             or ".." in path
