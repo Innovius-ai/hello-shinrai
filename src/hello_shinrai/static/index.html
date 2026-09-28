@@ -34,28 +34,31 @@
     <main class="workspace">
       <section class="panel active" id="panel-text" aria-labelledby="tab-text-title">
         <div class="panel-heading">
-          <div><p class="eyebrow">Start here</p><h1 id="tab-text-title">See protection happen</h1><p>Detect personal data or replace it with useful stand-ins.</p></div>
+          <div><p class="eyebrow">Start here</p><h1 id="tab-text-title">See protection happen</h1><p>Detect personal data or replace it with useful stand-ins. Uses the native PII API v2: <code>/v2/detect</code>, <code>/v2/protect</code>, and <code>/v2/restore</code>.</p></div>
           <span class="step-badge">ShinrAI key only</span>
         </div>
         <form id="text-form" class="surface">
-          <div class="field-row three">
-            <label>Operation<select id="text-operation"><option value="redact">Protect text</option><option value="analyze">Detect only</option><option value="batch">Consistent batch</option></select></label>
-            <label>Mode<select id="text-mode"><option value="replace">Replace &amp; restore</option><option value="mask">Mask</option><option value="label">Label</option></select></label>
+          <div class="field-row four">
+            <label>Operation<select id="text-operation"><option value="redact">Protect text</option><option value="analyze">Detect only</option><option value="batch">Consistent batch</option><option value="restore">Restore locally</option><option value="restore-remote">Restore via /v2/restore</option></select></label>
+            <label>Mode<select id="text-mode"><option value="replace">Pseudonymize</option><option value="mask">Mask</option><option value="label">Label</option></select></label>
             <label>Tier<select id="text-tier"><option value="standard">Standard</option><option value="batch">Batch</option><option value="realtime">Real-time · fast</option></select></label>
+            <label>API<select id="text-api"><option value="v2">Native v2</option><option value="v1">Native v1 (legacy)</option></select></label>
           </div>
           <label class="block-label">Input<textarea id="text-input" rows="8">Please send the contract to Ada Lovelace at ada@example.org. Her office is at 12 Analytical Engine Way, London.</textarea></label>
-          <p class="hint" id="batch-hint">For a batch, separate texts with a line containing <code>---</code>.</p>
-          <details class="advanced"><summary>Model and detection options</summary><div class="field-row two"><label>ShinrAI model<input id="text-model" value="shinrai-latest"></label><label>Threshold <output id="threshold-value">0.70</output><input id="text-threshold" type="range" min="0" max="1" step="0.05" value="0.7"></label></div></details>
+          <p class="hint" id="batch-hint">For a batch, separate texts with a line containing <code>---</code>. Restore uses the replacement map of your last Pseudonymize or Label run.</p>
+          <details class="advanced"><summary>Model and detection options</summary><div class="field-row three"><label>ShinrAI model<input id="text-model" value="latest" spellcheck="false"></label><label>Language<input id="text-language" value="auto" spellcheck="false"></label><div><label class="inline-check"><input id="text-threshold-custom" type="checkbox"> Confidence floor · <output id="threshold-value">served default</output></label><input id="text-threshold" type="range" min="0" max="1" step="0.05" value="0.5" aria-label="Confidence floor" disabled></div></div></details>
           <div class="actions"><button class="button primary" type="submit">Run protection</button><button class="button quiet" id="use-simple-example" type="button">Reset example</button><span class="run-status" id="text-status"></span></div>
         </form>
-        <div class="result-grid hidden" id="text-result"><article class="surface result-card"><p class="eyebrow">Original with findings</p><div id="text-original" class="prose-output highlighted-output"></div></article><article class="surface result-card"><p class="eyebrow">Protected output</p><div id="text-output" class="prose-output"></div></article><article class="surface result-card"><p class="eyebrow">Findings and usage</p><pre id="text-json"></pre></article></div>
+        <div class="result-grid hidden" id="text-result"><article class="surface result-card"><p class="eyebrow">Original with findings</p><div id="text-original" class="prose-output highlighted-output"></div></article><article class="surface result-card"><p class="eyebrow">Output</p><div id="text-output" class="prose-output"></div><div class="actions"><button class="button quiet hidden" id="text-restore-output" type="button">Restore this output</button></div></article><article class="surface result-card"><p class="eyebrow">Findings and usage</p><pre id="text-json"></pre></article></div>
       </section>
 
       <section class="panel" id="panel-files" aria-labelledby="tab-files-title">
-        <div class="panel-heading"><div><p class="eyebrow">Documents and scans</p><h1 id="tab-files-title">Protect a file</h1><p>TXT, PDF, DOCX, PNG, JPEG, and BMP. Nothing goes to an LLM yet.</p></div><span class="step-badge">10 MB maximum</span></div>
+        <div class="panel-heading"><div><p class="eyebrow">Documents and scans</p><h1 id="tab-files-title">Protect a file</h1><p>TXT, PDF, DOCX, PNG, JPEG, and BMP. Nothing goes to an LLM yet. API v2 fills detected text in images and returns protected text for documents.</p></div><span class="step-badge">10 MB maximum</span></div>
         <form id="file-form" class="surface upload-surface">
           <label class="dropzone" id="dropzone"><input id="file-input" type="file" accept=".txt,.pdf,.docx,.png,.jpg,.jpeg,.bmp" required><span class="drop-icon">＋</span><strong>Choose a file</strong><small>or drop it here</small></label>
-          <div class="field-row two"><label>Protection mode<select id="file-mode"><option value="replace">Replace</option><option value="mask">Mask</option><option value="label">Label</option></select></label><div class="actions align-end"><button class="button primary" type="submit">Protect file</button><span class="run-status" id="file-status"></span></div></div>
+          <div class="field-row three"><label>Protection mode<select id="file-mode"><option value="replace">Pseudonymize</option><option value="mask">Mask</option><option value="label">Label</option></select></label><label>Output<select id="file-api"><option value="v2">API v2 · text and images</option><option value="v1">API v1 · redacted PDF</option></select></label><label>Language<input id="file-language" value="auto" spellcheck="false"></label></div>
+          <p class="hint" id="file-api-hint">API v2: text files and images use <code>/v2/protect</code> (images come back with detected text filled). PDF and DOCX run as a <code>/v2/jobs</code> document job that returns protected text.</p>
+          <div class="actions"><button class="button primary" type="submit">Protect file</button><span class="run-status" id="file-status"></span></div>
         </form>
         <div id="attachment-list" class="attachment-list"></div>
       </section>
@@ -77,7 +80,7 @@
               <div class="actions"><button class="button primary" id="send-chat" type="submit">Send protected</button><button class="button danger hidden" id="stop-chat" type="button">Stop</button><span class="run-status" id="chat-status"></span></div>
             </form>
           </div>
-          <aside class="surface flow-card"><p class="eyebrow">What leaves your computer</p><ol><li>Your message goes to ShinrAI.</li><li>Only protected text and visuals go to the LLM.</li><li>The LLM replies with replacements.</li><li>Original values are restored here.</li></ol><p class="notice">Visual protection covers detected text. It does not hide faces, barcodes, or non-text identifiers.</p></aside>
+          <aside class="surface flow-card"><p class="eyebrow">What leaves your computer</p><ol><li>Your message goes to ShinrAI (<code>POST /v2/protect</code>). Earlier pairs go along as <code>mapping.known</code>, so a name keeps its stand-in for the whole conversation.</li><li>Only protected text and visuals go to the LLM.</li><li>The LLM replies with replacements.</li><li>Original values are restored here.</li></ol><p class="notice">Visual protection covers detected text. It does not hide faces, barcodes, or non-text identifiers.</p></aside>
         </div>
       </section>
 
@@ -92,7 +95,7 @@
       </section>
 
       <section class="panel" id="panel-explorer" aria-labelledby="tab-explorer-title">
-        <div class="panel-heading"><div><p class="eyebrow">Admin workbench</p><h1 id="tab-explorer-title">API explorer</h1><p>Only reviewed processing routes and safe routes discovered from OpenAPI are callable.</p></div><span class="step-badge">No automatic retry</span></div>
+        <div class="panel-heading"><div><p class="eyebrow">Admin workbench</p><h1 id="tab-explorer-title">API explorer</h1><p>Native API v2 operations come first, then v1 and the Azure, AWS, and Google compatibility routes. Only reviewed processing routes and safe routes discovered from OpenAPI are callable.</p></div><span class="step-badge">No automatic retry</span></div>
         <form id="explorer-form" class="surface">
           <label class="block-label">Operation<select id="explorer-operation"></select></label>
           <div class="operation-meta" id="operation-meta"></div>

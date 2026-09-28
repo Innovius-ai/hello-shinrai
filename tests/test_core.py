@@ -112,14 +112,81 @@ def test_unavailable_keyring_falls_back_to_session_only(monkeypatch):
     assert credentials.read("shinrai") == ""
 
 
-
 def test_vendor_calls_use_the_v1_vendor_prefix():
     from hello_shinrai.client import vendor_path
 
     assert vendor_path("/language/:analyze-text") == "/v1/azure/language/:analyze-text"
-    assert vendor_path("/text/analytics/v3.1/entities/recognition/pii") == "/v1/azure/text/analytics/v3.1/entities/recognition/pii"
-    assert vendor_path("/v2/projects/hello/locations/global/content:inspect") == "/v1/google/v2/projects/hello/locations/global/content:inspect"
+    assert (
+        vendor_path("/text/analytics/v3.1/entities/recognition/pii")
+        == "/v1/azure/text/analytics/v3.1/entities/recognition/pii"
+    )
+    assert (
+        vendor_path("/v2/projects/hello/locations/global/content:inspect")
+        == "/v1/google/v2/projects/hello/locations/global/content:inspect"
+    )
     assert vendor_path("/v2/infoTypes") == "/v1/google/v2/infoTypes"
     assert vendor_path("/providers/aws/credentials") == "/v1/aws/providers/aws/credentials"
     assert vendor_path("/v2/detect") == "/v2/detect" and vendor_path("/v1/analyze") == "/v1/analyze"
     assert vendor_path("/v1/azure/language/:analyze-text") == "/v1/azure/language/:analyze-text"
+
+
+def test_v2_mapping_helpers_keep_the_map_restorable():
+    from hello_shinrai.client import apply_replacements, known_block, merge_pairs, reversible_pairs, v1_model, v2_model
+
+    delta = [
+        {"original": "Ada Lovelace", "replacement": "Grace Palmer", "reversible": True},
+        {"original": "ada@example.org", "replacement": "***", "reversible": False},
+        {"original": "Bob", "replacement": "Grace Palmer", "reversible": True},  # would make restore ambiguous
+        {"original": "Berlin", "replacement": "Berlin", "reversible": True},
+    ]
+    assert reversible_pairs(delta) == {"Ada Lovelace": "Grace Palmer"}
+    assert reversible_pairs({"Ada": "[PERSON_1]"}) == {"Ada": "[PERSON_1]"}
+    merged = merge_pairs({"Ada Lovelace": "Grace Palmer"}, [{"original": "Ada Lovelace", "replacement": "Other"}])
+    assert merged == {"Ada Lovelace": "Grace Palmer"}
+    assert known_block(merged) == {
+        "known": [{"original": "Ada Lovelace", "replacement": "Grace Palmer"}],
+        "reserved": ["Grace Palmer"],
+    }
+    entities = [
+        {"span": {"start": 0, "end": 3}, "replacement": "Bob"},
+        {"span": {"start": 13, "end": 19}, "replacement": "[CITY]"},
+        {"span": {"start": 14, "end": 15}, "replacement": "overlap"},  # overlaps: skipped
+        {"span": {"start": 4, "end": 9}},  # action keep: no replacement
+    ]
+    assert apply_replacements("Ada lives in Berlin", entities) == "Bob lives in [CITY]"
+    # Code-point offsets: an emoji before a span counts as one position.
+    assert apply_replacements("🙂 Ada", [{"span": {"start": 2, "end": 5}, "replacement": "Bob"}]) == "🙂 Bob"
+    assert v2_model("shinrai-latest") == v2_model("") == "latest" and v2_model("v1.4") == "v1.4"
+    assert v1_model("latest") == "shinrai-latest"
+
+
+def test_v2_trace_view_hides_image_bytes_and_ocr_text_from_safe_export():
+    from hello_shinrai.client import trace_view
+
+    body = {
+        "results": [
+            {
+                "input_id": "1",
+                "output": {"media_type": "image/png", "data_b64": "QUJD" * 100},
+                "media": {"box_unit": "px"},
+                "text": "Contact Ada",
+                "entities": [{"type": "PERSON", "text": "Ada"}],
+            }
+        ]
+    }
+    view = trace_view(body)
+    assert view["results"][0]["output"]["data_b64"] == "[400 base64 characters]"
+    assert body["results"][0]["output"]["data_b64"].startswith("QUJD")  # the original stays untouched
+    safe = sanitize(view)
+    assert safe["results"][0]["ocr_text"] == "[omitted from safe export]"
+    assert safe["results"][0]["entities"][0]["original"] == "[omitted from safe export]"
+
+
+def test_catalog_lists_native_v2_first_and_matches_vendor_prefixes():
+    assert OPERATIONS[0]["group"] == "ShinrAI native API v2"
+    groups = list(dict.fromkeys(item["group"] for item in OPERATIONS))
+    assert groups[:2] == ["ShinrAI native API v2", "ShinrAI native v1 (legacy)"]
+    ids = {item["id"] for item in OPERATIONS if item["group"] == "ShinrAI native API v2"}
+    assert {"v2.detect", "v2.protect", "v2.restore", "v2.capabilities", "v2.types", "v2.usage", "v2.job-create"} <= ids
+    discovered = public_catalog({("POST", "/v1/google/v2/projects/{project}/locations/{location}/content:inspect")})
+    assert next(item for item in discovered if item["id"] == "google.inspect")["availability"] == "available"

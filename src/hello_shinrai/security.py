@@ -59,7 +59,11 @@ def sanitize(value: Any, *, include_sensitive: bool = False) -> Any:
                 "known_replacements",
                 "original",
                 "original_input",
+                "original_inputs",
                 "original_body",
+                "ocr_text",
+                "restored_text",
+                "restored_response",
             }:
                 result[key] = "[omitted from safe export]"
             else:

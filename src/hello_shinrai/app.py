@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from importlib.resources import files
+from pathlib import PurePath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -21,7 +23,25 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .catalog import BY_ID, public_catalog, template_matches
-from .client import RemoteError, Result, ShinraiClient, compact_json, render_pdf, response_body, vendor_path
+from .client import (
+    DOCUMENT_TYPES,
+    LANGUAGE_PATTERN,
+    PRESETS,
+    UPLOAD_TYPES,
+    RemoteError,
+    Result,
+    ShinraiClient,
+    compact_json,
+    known_block,
+    mapping_delta,
+    merge_pairs,
+    render_pdf,
+    response_body,
+    reversible_pairs,
+    v1_model,
+    v2_options,
+    vendor_path,
+)
 from .restore import Restorer, restore
 from .security import sanitize, validate_base_url
 from .state import Attachment, RuntimeState
@@ -43,13 +63,19 @@ class LlmSettings(BaseModel):
     remember: bool = False
 
 
+# Modes whose replacements can be restored: pseudonyms (replace) and per-value labels.
+RESTORABLE_MODES = {"replace", "label"}
+
+
 class TextRun(BaseModel):
-    operation: Literal["analyze", "redact", "batch"] = "redact"
+    operation: Literal["analyze", "redact", "batch", "restore", "restore-remote"] = "redact"
     text: str = Field(min_length=1, max_length=200_000)
     mode: Literal["replace", "mask", "label"] = "replace"
-    model: str = "shinrai-latest"
+    api: Literal["v2", "v1"] = "v2"
+    model: str = "latest"
     tier: Literal["standard", "batch", "realtime"] = "standard"
-    threshold: float = Field(default=0.7, ge=0, le=1)
+    threshold: float | None = Field(default=None, ge=0, le=1)
+    language: str = Field(default="auto", pattern=LANGUAGE_PATTERN)
 
 
 class DiscoverModels(BaseModel):
@@ -65,9 +91,10 @@ class ChatRun(BaseModel):
     vision_confirmed: bool = False
     stream: bool = True
     mode: Literal["replace", "mask", "label"] = "replace"
-    shinrai_model: str = "shinrai-latest"
+    shinrai_model: str = "latest"
     tier: Literal["standard", "batch", "realtime"] = "realtime"
-    threshold: float = Field(default=0.7, ge=0, le=1)
+    threshold: float | None = Field(default=None, ge=0, le=1)
+    language: str = Field(default="auto", pattern=LANGUAGE_PATTERN)
 
 
 class AzureSettings(BaseModel):
@@ -138,7 +165,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'"
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'"
         )
         return response
 
@@ -167,6 +194,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             },
             "azure": {"endpoint": connection.azure_url, "has_key": bool(connection.azure_key)},
             "secure_storage": credentials.available(),
+            "native_api": state.native_api,
             "capabilities": state.capabilities,
             "usage": state.usage,
             "attachments": attachment_views(state),
@@ -179,26 +207,29 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             url = validate_base_url(body.base_url)
             key = body.api_key or state.connection.shinrai_key
             client = ShinraiClient(url, key, http=app.state.http)
-            models, usage, routes = await client.connect()
+            capabilities, usage, routes, native_api = await client.connect()
         except (ValueError, RemoteError) as exc:
             trace_error(state, "shinrai.connect", exc, destination=body.base_url)
             raise api_error(exc)
         state.connection.shinrai_url, state.connection.shinrai_key = url, key
-        state.capabilities, state.usage, state.discovered_routes = models.body, usage.body, routes
+        state.capabilities, state.usage, state.discovered_routes = capabilities.body, usage.body, routes
+        state.native_api = native_api
         saved = keyring_module().write("shinrai", key) if body.remember else False
+        paths = ["/v2/capabilities", "/v2/usage"] if native_api == "v2" else ["/v1/models", "/v1/usage"]
         state.traces.insert(
             0,
             make_trace(
                 "shinrai.connect",
-                destination=url,
+                destination=[url + path for path in paths],
                 status="success",
-                elapsed_ms=models.elapsed_ms + usage.elapsed_ms,
-                response={"models": models.body, "usage": usage.body},
-                response_headers={**models.headers, **usage.headers},
+                elapsed_ms=capabilities.elapsed_ms + usage.elapsed_ms,
+                response={"native_api": native_api, "capabilities": capabilities.body, "usage": usage.body},
+                response_headers={**capabilities.headers, **usage.headers},
             ),
         )
         return {
-            "capabilities": models.body,
+            "native_api": native_api,
+            "capabilities": capabilities.body,
             "usage": usage.body,
             "securely_saved": saved,
             "routes_discovered": len(routes),
@@ -268,25 +299,18 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
     @app.post("/api/text")
     async def run_text(body: TextRun):
         state: RuntimeState = app.state.runtime
+        if body.operation == "restore":
+            return restore_text_locally(state, body.text)
         client = configured_shinrai(app)
-        path = "/v1/analyze" if body.operation == "analyze" else "/v1/redact/batch"
-        request_body: dict[str, Any]
-        if body.operation == "analyze":
-            request_body = {"text": body.text, "model": body.model, "tier": body.tier, "threshold": body.threshold}
-        else:
-            texts = [part.strip() for part in body.text.split("\n---\n")] if body.operation == "batch" else [body.text]
-            request_body = {
-                "texts": texts,
-                "mode": body.mode,
-                "model": body.model,
-                "tier": body.tier,
-                "threshold": body.threshold,
-                "include_mapping": body.mode == "replace",
-                "include_entities": True,
-            }
+        try:
+            require_native(state, "v2" if body.operation == "restore-remote" else body.api)
+            path, request_body = text_request(state, body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         trace = make_trace(
             "text." + body.operation,
             destination=state.connection.shinrai_url + path,
+            api="v2" if path.startswith("/v2/") else "v1",
             request=request_body,
             status="running",
         )
@@ -297,31 +321,56 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         except RemoteError as exc:
             fail_trace(trace, exc)
             raise api_error(exc)
+        if body.operation in {"redact", "batch"}:
+            returned = mapping_delta(result.body) if body.api == "v2" else (result.body or {}).get("mapping")
+            state.text_mapping = reversible_pairs(returned) if body.mode in RESTORABLE_MODES else {}
+        if body.operation == "restore-remote":
+            rows = result.body.get("results") if isinstance(result.body, dict) else None
+            trace["response"] = {
+                "restored_text": [row.get("text") for row in rows or [] if isinstance(row, dict)],
+                "restored": result.body.get("restored") if isinstance(result.body, dict) else None,
+            }
         return {"result": result.body, "trace": sanitize(trace, include_sensitive=True)}
 
     @app.post("/api/files")
     async def upload_file(
         file: UploadFile = File(...),  # noqa: B008 - FastAPI dependency marker
         mode: Literal["replace", "mask", "label"] = Form("replace"),
+        api: Literal["v2", "v1"] = Form("v2"),
+        language: str = Form("auto"),
     ):
         state: RuntimeState = app.state.runtime
         content = await file.read(10_000_001)
-        media_type = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
+        media_type = upload_media_type(file.content_type, file.filename)
+        if not re.fullmatch(LANGUAGE_PATTERN, language):
+            raise HTTPException(422, "Enter a BCP 47 language tag such as en or de, or auto.")
         trace = make_trace(
             "file.protect",
-            destination=state.connection.shinrai_url + "/v1/documents/jobs",
+            destination=state.connection.shinrai_url + file_route(api, media_type),
+            api=api,
             request={
                 "content_type": media_type,
                 "bytes": len(content),
                 "mode": mode,
+                "language": language,
                 "original_filename": file.filename,
             },
             status="running",
         )
         state.traces.insert(0, trace)
         try:
-            result = await configured_shinrai(app).document(content, media_type, mode=mode, mapping=mode == "replace")
-            pages = render_pdf(result["pdf"])
+            client = configured_shinrai(app)
+            require_native(state, api)
+            if api == "v1":
+                result = await client.document(content, media_type, mode=mode, mapping=mode == "replace")
+                pages = render_pdf(result["pdf"])
+            else:
+                require_document_jobs(state, media_type)
+                result = await client.protect_file_v2(content, media_type, mode=mode, language=language)
+                pages = [result["image"]] if result["image"] else []
+        except HTTPException as exc:
+            fail_trace(trace, exc)
+            raise
         except (ValueError, RemoteError) as exc:
             fail_trace(trace, exc)
             raise api_error(exc)
@@ -337,13 +386,19 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             job_id=result["job_id"],
             cleanup=result["cleanup"],
             trace_id=trace["id"],
+            api=result.get("api", api),
+            protected_image=result.get("image", b""),
+            entities=result.get("entities"),
         )
         state.attachments[identifier] = attachment
+        if result.get("request") is not None:
+            trace["shinrai_request"] = result["request"]
         trace.update(
             status="success",
             elapsed_ms=result["elapsed_ms"],
             response={
                 "job": result["job"],
+                **({"shinrai_response": result["response"]} if "response" in result else {}),
                 "protected_text": result["text"],
                 "mapping": result["mapping"],
                 "pages_rendered": len(pages),
@@ -361,7 +416,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         return Response(attachment.page_images[page - 1], media_type="image/png")
 
     @app.get("/api/attachments/{identifier}/download/{kind}")
-    async def attachment_download(identifier: str, kind: Literal["text", "pdf", "mapping"]):
+    async def attachment_download(identifier: str, kind: Literal["text", "pdf", "image", "mapping"]):
         attachment = get_attachment(app.state.runtime, identifier)
         if kind == "text":
             return Response(
@@ -370,12 +425,30 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
                 headers={"Content-Disposition": "attachment; filename=protected.txt"},
             )
         if kind == "pdf":
+            if not attachment.protected_pdf:
+                raise HTTPException(
+                    404, "This attachment has no redacted PDF. API v2 document jobs return protected text."
+                )
             return Response(
                 attachment.protected_pdf,
                 media_type="application/pdf",
                 headers={"Content-Disposition": "attachment; filename=protected.pdf"},
             )
-        return JSONResponse(attachment.mapping, headers={"Content-Disposition": "attachment; filename=protected.json"})
+        if kind == "image":
+            if not attachment.protected_image:
+                raise HTTPException(404, "This attachment has no redacted image.")
+            return Response(
+                attachment.protected_image,
+                media_type="image/png",
+                headers={"Content-Disposition": "attachment; filename=protected.png"},
+            )
+        # API v2 attachments export the map in the shape POST /v2/restore accepts.
+        mapping: Any = (
+            {"mapping": {"known": known_block(attachment.mapping)["known"]}}
+            if attachment.api == "v2"
+            else attachment.mapping
+        )
+        return JSONResponse(mapping, headers={"Content-Disposition": "attachment; filename=protected.json"})
 
     @app.delete("/api/attachments/{identifier}")
     async def delete_attachment(identifier: str):
@@ -402,7 +475,13 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         query = {"api-version": body.api_version} if body.path.startswith("/language/") else {}
         calls = [
             call_azure(
-                app, state.connection.shinrai_url, state.connection.shinrai_key, vendor_path(body.path), query, body.body, "ShinrAI"
+                app,
+                state.connection.shinrai_url,
+                state.connection.shinrai_key,
+                vendor_path(body.path),
+                query,
+                body.body,
+                "ShinrAI",
             )
         ]
         if body.include_real_azure:
@@ -511,6 +590,75 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
     return app
 
 
+def require_native(state: RuntimeState, api: str) -> None:
+    if api == "v2" and state.native_api == "v1":
+        raise ValueError(
+            "This ShinrAI deployment does not serve the native API v2. Choose API v1 or update the deployment."
+        )
+
+
+def text_request(state: RuntimeState, body: TextRun) -> tuple[str, dict[str, Any]]:
+    """The Text workspace request: native v2 by default, the v1 routes when selected."""
+    if body.operation == "restore-remote":
+        if not state.text_mapping:
+            raise ValueError("Protect a text with Replace or Label first. No restorable replacement map is loaded.")
+        known = known_block(state.text_mapping)["known"]
+        return "/v2/restore", {"mapping": {"known": known}, "inputs": [{"id": "1", "text": body.text}]}
+    texts = [part.strip() for part in body.text.split("\n---\n")] if body.operation == "batch" else [body.text]
+    if not all(texts):
+        raise ValueError("Every batch text needs content. Remove empty sections between --- lines.")
+    if body.api == "v1":
+        threshold = 0.7 if body.threshold is None else body.threshold
+        if body.operation == "analyze":
+            return "/v1/analyze", {
+                "text": body.text,
+                "model": v1_model(body.model),
+                "tier": body.tier,
+                "threshold": threshold,
+            }
+        return "/v1/redact/batch", {
+            "texts": texts,
+            "mode": body.mode,
+            "model": v1_model(body.model),
+            "tier": body.tier,
+            "threshold": threshold,
+            "include_mapping": body.mode == "replace",
+            "include_entities": True,
+        }
+    options = v2_options(model=body.model, tier=body.tier, threshold=body.threshold, language=body.language)
+    if body.operation == "analyze":
+        return "/v2/detect", {"text": body.text, **options, "output": {"include": ["entities"]}}
+    inputs = {"text": texts[0]} if body.operation == "redact" else {"texts": texts}
+    return "/v2/protect", {
+        **inputs,
+        **options,
+        "policy": {"preset": PRESETS[body.mode]},
+        "output": {"include": ["entities", "mapping"]},
+    }
+
+
+def restore_text_locally(state: RuntimeState, text: str) -> dict[str, Any]:
+    """Restore with the last Text protection map in this process; nothing leaves the computer."""
+    if not state.text_mapping:
+        raise HTTPException(422, "Protect a text with Replace or Label first. No restorable replacement map is loaded.")
+    started = time.perf_counter()
+    try:
+        restored = restore(text, state.text_mapping)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    trace = make_trace(
+        "text.restore",
+        destination="local restore (no network request)",
+        request={"text": text, "pairs": len(state.text_mapping)},
+        response={"restored_text": restored},
+        status="success",
+        elapsed_ms=elapsed(started),
+    )
+    state.traces.insert(0, trace)
+    result = {"results": [{"input_id": "1", "text": restored}], "restored_locally": True}
+    return {"result": result, "trace": sanitize(trace, include_sensitive=True)}
+
+
 async def run_chat(app: FastAPI, body: ChatRun):
     state: RuntimeState = app.state.runtime
     connection = state.connection
@@ -557,26 +705,33 @@ async def run_chat(app: FastAPI, body: ChatRun):
                 if attachment.mapping
                 else attachment.protected_text
             )
-        protected = await configured_shinrai(app).protect_batch(
-            originals,
+        require_native(state, "v2")
+        # One POST /v2/protect for the whole conversation. Earlier pairs go in mapping.known,
+        # so a person keeps one surrogate for the conversation (v2 draws new ones per request).
+        keeps_map = body.mode in RESTORABLE_MODES
+        sent = [index for index, text in enumerate(originals) if text]
+        protected, request_body = await configured_shinrai(app).protect_texts(
+            [originals[index] for index in sent],
             mode=body.mode,
             model=body.shinrai_model,
             tier=body.tier,
             threshold=body.threshold,
-            known=state.chat.mapping,
-            include_entities=True,
+            language=body.language,
+            known=state.chat.mapping if keeps_map else None,
         )
-        values = protected.body.get("results", [])
-        if len(values) != len(originals) or any(not isinstance(row.get("text"), str) for row in values):
-            raise RemoteError("ShinrAI returned an incomplete protection result.", body=protected.body)
-        if body.mode == "replace":
-            returned_mapping = protected.body.get("mapping", {})
-            if not isinstance(returned_mapping, dict):
-                raise RemoteError("ShinrAI returned an invalid replacement map.")
-            state.chat.mapping.update(returned_mapping)
+        rows = protected.body.get("results") if isinstance(protected.body, dict) else None
+        by_id = {str(row.get("input_id")): row for row in rows or [] if isinstance(row, dict)}
+        values = [""] * len(originals)
+        for number, index in enumerate(sent, start=1):
+            row = by_id.get(str(number))
+            if not row or row.get("status", "ok") != "ok" or not isinstance(row.get("output"), str):
+                raise RemoteError("ShinrAI returned an incomplete protection result.", body=protected.body)
+            values[index] = row["output"]
+        if keeps_map:
+            state.chat.mapping = merge_pairs(state.chat.mapping, mapping_delta(protected.body))
         else:
             state.chat.mapping.clear()
-        protected_by_name = {name: values[index]["text"] for name, index in positions}
+        protected_by_name = {name: values[index] for name, index in positions}
         messages = []
         if body.system:
             messages.append({"role": "system", "content": protected_by_name["system"]})
@@ -593,7 +748,11 @@ async def run_chat(app: FastAPI, body: ChatRun):
         trace.update(
             status="calling model",
             shinrai={
-                "request": {"texts": originals, "mode": body.mode, "known_replacements": state.chat.mapping},
+                "endpoint": "/v2/protect",
+                "request": {
+                    **{key: value for key, value in request_body.items() if key != "inputs"},
+                    "original_inputs": [item["text"] for item in request_body["inputs"]],
+                },
                 "response": protected.body,
                 "elapsed_ms": protected.elapsed_ms,
                 "headers": protected.headers,
@@ -620,7 +779,7 @@ async def run_chat(app: FastAPI, body: ChatRun):
                             status=response.status_code,
                             body=raw.decode(errors="replace")[:4000],
                         )
-                    restorer = Restorer(state.chat.mapping if body.mode == "replace" else {})
+                    restorer = Restorer(state.chat.mapping if keeps_map else {})
                     provider_text, restored_text, first_token_ms = "", "", None
                     async for line in response.aiter_lines():
                         delta = stream_delta(line, connection.llm_protocol)
@@ -649,7 +808,7 @@ async def run_chat(app: FastAPI, body: ChatRun):
                         body=provider_body,
                     )
                 provider_text = response_text(provider_body, connection.llm_protocol)
-                restored_text = restore(provider_text, state.chat.mapping) if body.mode == "replace" else provider_text
+                restored_text = restore(provider_text, state.chat.mapping) if keeps_map else provider_text
                 first_token_ms = None
                 yield event("delta", provider=provider_text, restored=restored_text)
         total_ms = elapsed(started)
@@ -914,19 +1073,68 @@ def parse_models(body: Any) -> list[dict[str, Any]]:
 
 
 def attachment_view(item: Attachment) -> dict[str, Any]:
+    downloads = ["text"]
+    downloads += ["pdf"] if item.protected_pdf else []
+    downloads += ["image"] if item.protected_image else []
+    downloads += ["mapping"] if item.mapping else []
     return {
         "id": item.id,
         "name": item.name,
         "media_type": item.media_type,
+        "api": item.api,
         "pages": len(item.page_images),
+        "entities": item.entities,
         "protected_text": item.protected_text,
         "has_mapping": bool(item.mapping),
+        "downloads": downloads,
         "cleanup": item.cleanup,
     }
 
 
 def attachment_views(state):
     return [attachment_view(item) for item in state.attachments.values()]
+
+
+MEDIA_ALIASES = {"image/jpg": "image/jpeg", "image/x-ms-bmp": "image/bmp", "image/x-bmp": "image/bmp"}
+EXTENSION_TYPES = {
+    ".txt": "text/plain",
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+}
+
+
+def upload_media_type(content_type: str | None, filename: str | None) -> str:
+    """The browser's media type, or the extension's when the browser sent a generic one."""
+    media_type = (content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    media_type = MEDIA_ALIASES.get(media_type, media_type)
+    if media_type not in UPLOAD_TYPES and filename:
+        return EXTENSION_TYPES.get(PurePath(filename).suffix.lower(), media_type)
+    return media_type
+
+
+def file_route(api: str, media_type: str) -> str:
+    if api == "v1":
+        return "/v1/documents/jobs"
+    return "/v2/uploads -> /v2/jobs (document)" if media_type in DOCUMENT_TYPES else "/v2/protect"
+
+
+def require_document_jobs(state: RuntimeState, media_type: str) -> None:
+    """Fail before uploading when the connected deployment lists no v2 document jobs."""
+    if media_type not in DOCUMENT_TYPES or not isinstance(state.capabilities, dict) or state.native_api != "v2":
+        return
+    inputs = state.capabilities.get("inputs")
+    if not isinstance(inputs, dict):
+        return
+    file_jobs = inputs.get("file", {}).get("jobs") if isinstance(inputs.get("file"), dict) else None
+    if file_jobs not in {"ga", "beta"}:
+        raise ValueError(
+            "This deployment does not serve API v2 document jobs. "
+            "Choose the Output 'API v1 · redacted PDF' for PDF and DOCX."
+        )
 
 
 def get_attachment(state, identifier):
@@ -957,9 +1165,11 @@ def complete_trace(trace: dict[str, Any], result: Result):
 
 
 def fail_trace(trace: dict[str, Any], exc: Exception):
-    trace.update(status="error", error=str(exc))
+    trace.update(status="error", error=exc.detail if isinstance(exc, HTTPException) else str(exc))
     if isinstance(exc, RemoteError):
         trace.update(http_status=exc.status, response=exc.body)
+        if exc.cleanup:
+            trace["cleanup"] = exc.cleanup
 
 
 def trace_error(state, operation, exc, **values):

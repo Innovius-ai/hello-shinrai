@@ -108,7 +108,8 @@ async function bootstrap() {
     $("secure-storage-note").textContent = value.secure_storage
       ? "Secure saving uses your operating system's credential store."
       : "No operating-system credential store is available. Keys remain in memory for this run.";
-    showCapabilities(value.capabilities, value.usage);
+    showCapabilities(value.capabilities, value.usage, value.native_api);
+    if (value.native_api === "v1") { $("text-api").value = "v1"; $("file-api").value = "v1"; $("file-api").dispatchEvent(new Event("change")); }
     state.connection.shinrai = value.capabilities ? "online" : value.shinrai.has_key ? "pending" : "offline";
     state.connection.llm = Boolean(value.llm.has_key && value.llm.model);
     state.connection.azure = Boolean(value.azure.has_key && value.azure.endpoint);
@@ -152,13 +153,16 @@ function renderConnectionStatus() {
   setReadiness("azure-card-status", state.connection.azure ? "Configured" : "Not configured", state.connection.azure ? "online" : "");
 }
 
-function showCapabilities(capabilities, usage) {
+function showCapabilities(capabilities, usage, nativeApi) {
   const card = $("capability-card");
   if (!capabilities) { card.textContent = "Connect to verify models, balance, and tier access."; return; }
-  const tiers = Object.entries(capabilities.tiers || {}).map(([name, row]) => `<span class="tier ${row.allowed ? "allowed" : "denied"}">${escapeHtml(name === "realtime" ? "Real-time · fast" : name)} · ${row.allowed ? "available" : "not entitled"}</span>`).join("");
+  // API v2 reports tiers as "allowed" | "not_in_plan"; v1 as { allowed: boolean }.
+  const allowed = (row) => row === "allowed" || row?.allowed === true;
+  const tiers = Object.entries(capabilities.tiers || {}).map(([name, row]) => `<span class="tier ${allowed(row) ? "allowed" : "denied"}">${escapeHtml(name === "realtime" ? "Real-time · fast" : name)} · ${allowed(row) ? "available" : "not entitled"}</span>`).join("");
   const models = (capabilities.models || []).map((model) => `${escapeHtml(model.id)}${model.status ? ` · ${escapeHtml(model.status)}` : ""}`).join("<br>");
-  const balance = usage?.balances?.available_records;
-  card.innerHTML = `<strong>${balance ?? "Unknown"} records available</strong><div class="tier-list">${tiers}</div><p>${models}</p>`;
+  const balance = usage?.available_records ?? usage?.balances?.available_records;
+  const api = nativeApi === "v1" ? "Native API v1 only (this deployment has no API v2)" : `Native API v2${capabilities.api_version ? ` · ${escapeHtml(capabilities.api_version)}` : ""}`;
+  card.innerHTML = `<strong>${balance ?? "Unknown"} records available</strong> · ${api}<div class="tier-list">${tiers}</div><p>${models}</p>`;
 }
 
 $("shinrai-settings").addEventListener("submit", async (event) => {
@@ -166,9 +170,13 @@ $("shinrai-settings").addEventListener("submit", async (event) => {
   const button = event.submitter; button.disabled = true; button.textContent = "Connecting…";
   try {
     const value = await jsonApi("/api/settings/shinrai", { method: "POST", json: { base_url: $("shinrai-url").value, api_key: $("shinrai-key").value, remember: $("remember-shinrai").checked } });
-    state.bootstrap.capabilities = value.capabilities; state.bootstrap.usage = value.usage;
-    showCapabilities(value.capabilities, value.usage); state.connection.shinrai = "online"; renderConnectionStatus(); $("shinrai-key").value = "";
-    toast(value.securely_saved ? "Connected and saved securely." : "ShinrAI connected for this run.");
+    const previousApi = state.bootstrap.native_api;
+    state.bootstrap.capabilities = value.capabilities; state.bootstrap.usage = value.usage; state.bootstrap.native_api = value.native_api;
+    if (value.native_api === "v2" && previousApi === "v1") { $("text-api").value = "v2"; $("file-api").value = "v2"; $("file-api").dispatchEvent(new Event("change")); }
+    showCapabilities(value.capabilities, value.usage, value.native_api); state.connection.shinrai = "online"; renderConnectionStatus(); $("shinrai-key").value = "";
+    if (value.native_api === "v1") { $("text-api").value = "v1"; $("file-api").value = "v1"; $("file-api").dispatchEvent(new Event("change")); }
+    const connected = value.securely_saved ? "Connected and saved securely." : "ShinrAI connected for this run.";
+    toast(value.native_api === "v1" ? `${connected} This deployment serves API v1 only: Text and Files switched to v1, and Chat needs API v2.` : connected, value.native_api === "v1");
     await refreshTraces(); await loadCatalog();
   } catch (error) { state.connection.shinrai = "offline"; renderConnectionStatus(); toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Connect ShinrAI"; }
@@ -214,11 +222,15 @@ $("load-models").addEventListener("click", async () => {
   finally { button.disabled = false; button.textContent = "Load models"; }
 });
 
-$("text-threshold").addEventListener("input", () => $("threshold-value").textContent = Number($("text-threshold").value).toFixed(2));
+function showThreshold() { $("threshold-value").textContent = $("text-threshold-custom").checked ? Number($("text-threshold").value).toFixed(2) : "served default"; }
+$("text-threshold").addEventListener("input", showThreshold);
+$("text-threshold-custom").addEventListener("change", () => { $("text-threshold").disabled = !$("text-threshold-custom").checked; showThreshold(); });
 $("use-simple-example").addEventListener("click", () => $("text-input").value = "Please send the contract to Ada Lovelace at ada@example.org. Her office is at 12 Analytical Engine Way, London.");
 function highlightFindings(text, entities = []) {
   const characters = [...text];
   const usable = entities.map((item) => {
+    // API v2 spans are half-open code-point ranges; [...text] indexes code points too.
+    if (Number.isInteger(item.span?.start) && Number.isInteger(item.span?.end)) return { ...item, offset: item.span.start, length: item.span.end - item.span.start };
     const offset = Number.isInteger(item.offset) ? item.offset : item.startIndex;
     const length = Number.isInteger(item.length) ? item.length : Number.isInteger(item.endIndex) ? item.endIndex - offset : null;
     return { ...item, offset, length };
@@ -236,35 +248,54 @@ function highlightFindings(text, entities = []) {
   output.push(escapeHtml(characters.slice(cursor).join("")));
   return output.join("");
 }
+function outputTexts(result) {
+  // v2 protect: results[].output; v2 restore and v1 batch: results[].text; v1 single: text.
+  const rows = result.results || [result];
+  return rows.map((row) => typeof row.output === "string" ? row.output : typeof row.text === "string" ? row.text : null).filter((text) => text !== null);
+}
 $("text-form").addEventListener("submit", async (event) => {
   event.preventDefault(); setStatus("text-status", "Running…");
+  const operation = $("text-operation").value;
   try {
     const value = await jsonApi("/api/text", { method: "POST", json: {
-      operation: $("text-operation").value, text: $("text-input").value, mode: $("text-mode").value,
-      model: $("text-model").value, tier: $("text-tier").value, threshold: Number($("text-threshold").value),
+      operation, text: $("text-input").value, mode: $("text-mode").value, api: $("text-api").value,
+      model: $("text-model").value, tier: $("text-tier").value, language: $("text-language").value.trim() || "auto",
+      threshold: $("text-threshold-custom").checked ? Number($("text-threshold").value) : null,
     }});
     $("text-result").classList.remove("hidden");
     const result = value.result;
-    const output = result.text || result.results?.map((row) => row.text).join("\n\n") || "Detection complete — see findings.";
-    const originals = $("text-operation").value === "batch" ? $("text-input").value.split("\n---\n").map((part) => part.trim()) : [$("text-input").value];
+    const texts = outputTexts(result);
+    const output = texts.length ? texts.join("\n\n") : "Detection complete — see findings.";
+    const originals = operation === "batch" ? $("text-input").value.split("\n---\n").map((part) => part.trim()) : [$("text-input").value];
     const rows = result.results || [result];
-    $("text-original").innerHTML = originals.map((text, index) => highlightFindings(text, rows[index]?.entities || [])).join("<hr>");
+    $("text-original").innerHTML = originals.map((text, index) => highlightFindings(text, operation.startsWith("restore") ? [] : rows[index]?.entities || [])).join("<hr>");
     $("text-output").textContent = output; $("text-json").textContent = pretty(result);
+    $("text-restore-output").classList.toggle("hidden", !["redact", "batch"].includes(operation) || !texts.length || $("text-mode").value === "mask");
     setStatus("text-status", `${value.trace.elapsed_ms} ms`, "success"); await refreshTraces();
   } catch (error) { setStatus("text-status", error.message, "error"); await refreshTraces(); }
+});
+$("text-restore-output").addEventListener("click", () => {
+  $("text-input").value = $("text-output").textContent; $("text-operation").value = "restore";
+  $("text-restore-output").classList.add("hidden"); setStatus("text-status", "Staged for local restore. Edit the text if you like, then run.");
 });
 
 const dropzone = $("dropzone");
 ["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.add("drag"); }));
 ["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.remove("drag"); }));
 dropzone.addEventListener("drop", (event) => { if (event.dataTransfer.files.length) $("file-input").files = event.dataTransfer.files; });
+$("file-api").addEventListener("change", () => {
+  $("file-api-hint").innerHTML = $("file-api").value === "v1"
+    ? "API v1: every file runs as a <code>/v1/documents/jobs</code> job. Images become image-only PDFs. Outputs include a flattened redacted PDF and page previews."
+    : "API v2: text files and images use <code>/v2/protect</code> (images come back with detected text filled). PDF and DOCX run as a <code>/v2/jobs</code> document job that returns protected text.";
+});
 $("file-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const file = $("file-input").files[0]; if (!file) return;
   const data = new FormData(); data.append("file", file); data.append("mode", $("file-mode").value);
+  data.append("api", $("file-api").value); data.append("language", $("file-language").value.trim() || "auto");
   setStatus("file-status", "Uploading and protecting…");
   try {
     const value = await jsonApi("/api/files", { method: "POST", body: data });
-    state.attachments.push(value.attachment); renderAttachments(); setStatus("file-status", "Protected and cleaned up remotely", "success"); await refreshTraces();
+    state.attachments.push(value.attachment); renderAttachments(); setStatus("file-status", `Protected · ${value.attachment.cleanup}`, "success"); await refreshTraces();
   } catch (error) { setStatus("file-status", error.message, "error"); await refreshTraces(); }
 });
 
@@ -272,7 +303,7 @@ async function renderAttachments() {
   const list = $("attachment-list"); list.replaceChildren();
   for (const item of state.attachments) {
     const card = document.createElement("article"); card.className = "surface attachment-card";
-    card.innerHTML = `<div class="attachment-head"><div><h3>${escapeHtml(item.name)}</h3><div class="attachment-meta">${escapeHtml(item.media_type)} · ${item.pages} preview page(s) · ${escapeHtml(item.cleanup)}</div></div><button class="button danger remove-attachment" data-id="${item.id}" type="button">Remove local copy</button></div><details><summary>Protected text</summary><pre>${escapeHtml(item.protected_text)}</pre></details><div class="preview-strip"></div><div class="actions"><button class="button quiet download-attachment" data-id="${item.id}" data-kind="text">Text</button><button class="button quiet download-attachment" data-id="${item.id}" data-kind="pdf">PDF</button>${item.has_mapping ? `<button class="button quiet download-attachment" data-id="${item.id}" data-kind="mapping">Private map</button>` : ""}</div>`;
+    card.innerHTML = `<div class="attachment-head"><div><h3>${escapeHtml(item.name)}</h3><div class="attachment-meta">${escapeHtml(item.media_type)} · API ${escapeHtml(item.api || "v1")} · ${Number.isInteger(item.entities) ? `${item.entities} finding(s) · ` : ""}${item.pages} preview page(s) · ${escapeHtml(item.cleanup)}</div></div><button class="button danger remove-attachment" data-id="${item.id}" type="button">Remove local copy</button></div><details><summary>Protected text</summary><pre>${escapeHtml(item.protected_text)}</pre></details><div class="preview-strip"></div><div class="actions">${(item.downloads || ["text", "pdf", ...(item.has_mapping ? ["mapping"] : [])]).map((kind) => `<button class="button quiet download-attachment" data-id="${item.id}" data-kind="${kind}">${{ text: "Text", pdf: "PDF", image: "Image", mapping: "Private map" }[kind] || escapeHtml(kind)}</button>`).join("")}</div>`;
     list.appendChild(card);
     const strip = card.querySelector(".preview-strip");
     for (let page = 1; page <= item.pages; page++) {

@@ -36,6 +36,9 @@ class Attachment:
     job_id: str
     cleanup: str
     trace_id: str
+    api: str = "v2"
+    protected_image: bytes = b""
+    entities: int | None = None
 
 
 @dataclass
@@ -51,6 +54,8 @@ class RuntimeState:
     connection: Connection = field(default_factory=Connection)
     capabilities: dict[str, Any] | None = None
     usage: dict[str, Any] | None = None
+    native_api: str | None = None
+    text_mapping: dict[str, str] = field(default_factory=dict)
     llm_model_count: int | None = None
     discovered_routes: set[tuple[str, str]] = field(default_factory=set)
     aws_credentials: dict[str, str] | None = None

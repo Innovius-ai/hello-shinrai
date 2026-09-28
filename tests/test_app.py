@@ -1,31 +1,243 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
+import re
 
 import httpx
 import pytest
+from PIL import Image
 
 from hello_shinrai.app import create_app
 from hello_shinrai.client import image_to_pdf
 
 REMOTE_REQUESTS: list[httpx.Request] = []
 DOCUMENT_ID = "42a75838-068b-4ed5-b975-6258eb25c397"
+V2_JOB_ID = "job_7f3a9c"
+V2_UPLOAD_ID = "up_5b1e0d"
+ORIGINALS = {"Ada Lovelace": "PERSON", "ada@example.org": "EMAIL"}
+OCR_TEXT = "Contact Ada Lovelace at ada@example.org."
+PROTECT_CALLS = [0]
 
 
 def protected_pdf() -> bytes:
-    from io import BytesIO
-
-    from PIL import Image
-
-    output = BytesIO()
+    output = io.BytesIO()
     Image.new("RGB", (120, 80), "white").save(output, format="PNG")
     return image_to_pdf(output.getvalue())
+
+
+def image_bytes(fmt: str = "PNG", color: str = "white") -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (160, 60), color).save(output, format=fmt)
+    return output.getvalue()
+
+
+def v2_inputs(body: dict) -> list[dict]:
+    if "text" in body:
+        return [{"id": "1", "kind": "text", "text": body["text"]}]
+    if "texts" in body:
+        return [{"id": str(index + 1), "kind": "text", "text": text} for index, text in enumerate(body["texts"])]
+    return body["inputs"]
+
+
+def v2_result(body: dict, *, protect: bool) -> dict:
+    """A small stand-in for the PII API v2: surrogates are drawn per request unless mapping.known pins them."""
+    PROTECT_CALLS[0] += protect
+    number = PROTECT_CALLS[0]
+    preset = (body.get("policy") or {}).get("preset", "pseudonymize")
+    known = {entry["original"]: entry["replacement"] for entry in (body.get("mapping") or {}).get("known", [])}
+    delta, results = [], []
+    for item in v2_inputs(body):
+        image = item["kind"] == "image"
+        text = OCR_TEXT if image else item["text"]
+        entities, output, cursor = [], [], 0
+        for match in re.finditer("|".join(re.escape(value) for value in ORIGINALS), text):
+            original, kind = match.group(0), ORIGINALS[match.group(0)]
+            entity = {
+                "id": f"e{len(entities) + 1}",
+                "type": kind,
+                "span": {"start": match.start(), "end": match.end()},
+                "confidence": 0.98,
+                "source": "model",
+            }
+            if image:
+                entity["coords"] = {"boxes": [{"page": 1, "box": [10 * len(entities), 5, 40, 12]}]}
+            if protect:
+                if preset == "mask":
+                    replacement = "*" * len(original)
+                elif original in known:
+                    replacement = known[original]
+                else:
+                    replacement = f"[{kind}_{number}]"
+                    if not any(entry["original"] == original for entry in delta):
+                        delta.append(
+                            {
+                                "id": f"mp_{len(delta) + 1}",
+                                "type": kind,
+                                "original": original,
+                                "replacement": replacement,
+                                "reversible": True,
+                            }
+                        )
+                entity.update(action="surrogate", replacement=replacement)
+                output.extend([text[cursor : match.start()], replacement])
+                cursor = match.end()
+            entities.append(entity)
+        output.append(text[cursor:])
+        row = {"input_id": item["id"], "status": "ok", "entities": entities}
+        if protect and image:
+            row["output"] = {
+                "media_type": item["media_type"],
+                "width": 160,
+                "height": 60,
+                "data_b64": base64.b64encode(image_bytes(item["media_type"].split("/")[1].upper(), "black")).decode(),
+            }
+        elif protect:
+            row["output"] = "".join(output)
+        if image:
+            row["media"] = {"media_type": item["media_type"], "width": 160, "height": 60, "box_unit": "px"}
+            if (body.get("output") or {}).get("include_text"):
+                row["text"] = OCR_TEXT
+        results.append(row)
+    answer = {
+        "request_id": "r1",
+        "api_version": "2.0.0",
+        "offset_unit": "codepoint",
+        "engine": {"model": "v1.4", "layers_requested": ["model"], "layers_run": ["model"], "degraded": False},
+        "results": results,
+        "usage": {"records": 1, "charged": True, "tier": "standard"},
+    }
+    if protect and "mapping" in ((body.get("output") or {}).get("include") or []):
+        answer["mapping"] = {"rev": len(known) + len(delta), "delta": [] if preset == "mask" else delta}
+    return answer
+
+
+def v2_response(request: httpx.Request) -> httpx.Response | None:
+    path = request.url.path
+    if request.url.host == "legacy.shinrai.example" and path.startswith("/v2/"):
+        return httpx.Response(404, json={"detail": "Not Found"})
+    if request.url.host == "local.shinrai.example" and path == "/v2/usage":
+        return httpx.Response(501, json={"error": {"code": "capability_unavailable", "retryable": False}})
+    if path == "/v2/capabilities":
+        return httpx.Response(
+            200,
+            json={
+                "api_version": "2.0.0",
+                "profile": "public",
+                "mode": "global",
+                "models": [{"id": "v1.4", "status": "ga"}],
+                "inputs": {
+                    "text": {"standard": "ga", "realtime": "ga", "jobs": "beta"},
+                    "file": {"standard": "unavailable", "realtime": "unavailable", "jobs": "beta"},
+                },
+                "tiers": {"standard": "allowed", "batch": "allowed", "realtime": "not_in_plan"},
+                "actions": {},
+                "restore": {"algorithms": ["shinrai-restore/1"]},
+            },
+        )
+    if path == "/v2/usage":
+        return httpx.Response(200, json={"plan": "starter", "available_records": 42.5, "last_30_days": {}})
+    if path in {"/v2/detect", "/v2/protect"}:
+        body = json.loads(request.content)
+        if any("INCOMPLETE" in item.get("text", "") for item in v2_inputs(body)):
+            return httpx.Response(200, json={"results": [], "engine": {"degraded": False}})
+        return httpx.Response(
+            200,
+            json=v2_result(body, protect=path == "/v2/protect"),
+            headers={"X-Records-Charged": "1", "X-Request-Id": "r1"},
+        )
+    if path == "/v2/restore":
+        body = json.loads(request.content)
+        reverse = {entry["replacement"]: entry["original"] for entry in body["mapping"]["known"]}
+        results = []
+        for item in body["inputs"]:
+            text = item["text"]
+            for replacement, original in reverse.items():
+                text = text.replace(replacement, original)
+            results.append({"input_id": item["id"], "text": text})
+        return httpx.Response(200, json={"results": results, "restored": len(results)})
+    if path == "/v2/uploads" and request.method == "POST":
+        content = request.content
+        return httpx.Response(
+            201,
+            json={
+                "id": V2_UPLOAD_ID,
+                "media_type": request.headers["content-type"],
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "expires_at": "2026-09-29T12:00:00Z",
+            },
+        )
+    if path == "/v2/jobs" and request.method == "POST":
+        body = json.loads(request.content)
+        assert request.headers.get("idempotency-key")
+        assert body["kind"] == "document" and body["inputs"][0]["source"] == {"upload": V2_UPLOAD_ID}
+        return httpx.Response(
+            202,
+            json={"id": V2_JOB_ID, "kind": "document", "status": "queued", "created_at": "2026-09-28T12:00:00Z"},
+            headers={"Location": f"/v2/jobs/{V2_JOB_ID}"},
+        )
+    job = f"/v2/jobs/{V2_JOB_ID}"
+    if path == job and request.method == "GET":
+        return httpx.Response(
+            200,
+            json={
+                "id": V2_JOB_ID,
+                "kind": "document",
+                "status": "succeeded",
+                "created_at": "2026-09-28T12:00:00Z",
+                "artifacts": {name: f"{job}/artifacts/{name}" for name in ("protected", "entities", "mapping")},
+            },
+        )
+    if path == job and request.method == "DELETE":
+        return httpx.Response(204)
+    if path == f"{job}/artifacts/protected":
+        return httpx.Response(
+            200, text="Contact [PERSON_1] at [EMAIL_1].", headers={"content-type": "text/plain; charset=utf-8"}
+        )
+    if path == f"{job}/artifacts/entities":
+        return httpx.Response(200, json={"entities": [{"id": "e1", "type": "PERSON", "span": {"start": 8, "end": 20}}]})
+    if path == f"{job}/artifacts/mapping":
+        return httpx.Response(
+            200,
+            json={
+                "delta": [
+                    {
+                        "id": "mp_1",
+                        "type": "PERSON",
+                        "original": "Ada Lovelace",
+                        "replacement": "[PERSON_1]",
+                        "reversible": True,
+                    },
+                    {
+                        "id": "mp_2",
+                        "type": "EMAIL",
+                        "original": "ada@example.org",
+                        "replacement": "[EMAIL_1]",
+                        "reversible": True,
+                    },
+                ]
+            },
+        )
+    return None
+
+
+def llm_reply(flattened: str) -> str:
+    person = re.search(r"\[PERSON_\d+\]", flattened)
+    email = re.search(r"\[EMAIL_\d+\]", flattened)
+    assert person, "the model must receive a surrogate"
+    return f"I emailed {person.group(0)} at {email.group(0) if email else 'the address'}."
 
 
 def remote_response(request: httpx.Request) -> httpx.Response:
     REMOTE_REQUESTS.append(request)
     if request.url.host == "models.example":
         return httpx.Response(200, json={"data": [{"id": "model-a"}, {"id": "model-b", "degraded": True}]})
+    native = v2_response(request)
+    if native is not None:
+        return native
     if request.url.path == "/v1/models":
         return httpx.Response(
             200,
@@ -41,7 +253,17 @@ def remote_response(request: httpx.Request) -> httpx.Response:
     if request.url.path == "/v1/usage":
         return httpx.Response(200, json={"balances": {"available_records": 42.5}, "plan": "starter"})
     if request.url.path == "/openapi.json":
-        return httpx.Response(200, json={"paths": {"/v1/analyze": {"post": {}}, "/console/account": {"get": {}}}})
+        return httpx.Response(
+            200,
+            json={
+                "paths": {
+                    "/v1/analyze": {"post": {}},
+                    "/v2/protect": {"post": {}},
+                    "/v1/azure/language/:analyze-text": {"post": {}},
+                    "/console/account": {"get": {}},
+                }
+            },
+        )
     if request.url.path in {"/providers/aws/credentials", "/v1/aws/providers/aws/credentials"}:
         return httpx.Response(
             200,
@@ -50,10 +272,10 @@ def remote_response(request: httpx.Request) -> httpx.Response:
                 "secretAccessKey": "synthetic-signing-secret",
             },
         )
+    if request.url.path == "/v1/analyze":
+        return httpx.Response(200, json={"entities": [{"category": "Person", "offset": 0, "length": 12}]})
     if request.url.path == "/v1/redact/batch":
         body = json.loads(request.content)
-        if any("INCOMPLETE" in text for text in body["texts"]):
-            return httpx.Response(200, json={"results": [], "mapping": {}})
         mapping = {"Ada Lovelace": "[PERSON_1]", "ada@example.org": "[EMAIL_1]"}
         results = []
         for text in body["texts"]:
@@ -73,19 +295,20 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         flattened = json.dumps(body)
         assert "Ada Lovelace" not in flattened
         assert "ada@example.org" not in flattened
-        assert "[PERSON_1]" in flattened
-        assert "customer-secret.txt" not in flattened
+        assert "customer-secret" not in flattened
+        reply = llm_reply(flattened)
         if body.get("stream"):
+            split = reply.index("[PERSON_") + 4
             chunks = [
-                {"choices": [{"delta": {"content": "I emailed [PER"}}]},
-                {"choices": [{"delta": {"content": "SON_1] at [EMAIL_1]."}}]},
+                {"choices": [{"delta": {"content": reply[:split]}}]},
+                {"choices": [{"delta": {"content": reply[split:]}}]},
             ]
             content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
             return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
         return httpx.Response(
             200,
             json={
-                "choices": [{"message": {"role": "assistant", "content": "I emailed [PERSON_1] at [EMAIL_1]."}}],
+                "choices": [{"message": {"role": "assistant", "content": reply}}],
                 "usage": {"total_tokens": 12},
             },
         )
@@ -93,9 +316,12 @@ def remote_response(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         flattened = json.dumps(body)
         assert "Ada Lovelace" not in flattened
-        assert "[PERSON_1]" in flattened
-        return httpx.Response(200, json={"output_text": "Response for [PERSON_1].", "usage": {"total_tokens": 7}})
-    if request.url.path.removeprefix("/v1/azure") in {"/language/:analyze-text", "/text/analytics/v3.1/entities/recognition/pii"}:
+        person = re.search(r"\[PERSON_\d+\]", flattened).group(0)
+        return httpx.Response(200, json={"output_text": f"Response for {person}.", "usage": {"total_tokens": 7}})
+    if request.url.path.removeprefix("/v1/azure") in {
+        "/language/:analyze-text",
+        "/text/analytics/v3.1/entities/recognition/pii",
+    }:
         assert request.headers.get("ocp-apim-subscription-key")
         assert request.headers.get("authorization") is None
         return httpx.Response(200, json={"provider": request.url.host, "results": {"documents": []}})
@@ -125,6 +351,7 @@ def remote_response(request: httpx.Request) -> httpx.Response:
 @pytest.fixture
 async def local():
     REMOTE_REQUESTS.clear()
+    PROTECT_CALLS[0] = 0
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(remote_response))
     app = create_app(http=upstream)
     async with app.router.lifespan_context(app):
@@ -162,9 +389,54 @@ async def test_connect_distinguishes_entitlement_and_filters_discovery(local):
     )
     assert response.status_code == 200
     body = response.json()
+    assert body["native_api"] == "v2"
+    assert body["capabilities"]["tiers"]["realtime"] == "not_in_plan"
+    assert body["usage"]["available_records"] == 42.5
+    assert {request.url.path for request in REMOTE_REQUESTS} >= {"/v2/capabilities", "/v2/usage"}
+    assert not any(request.url.path in {"/v1/models", "/v1/usage"} for request in REMOTE_REQUESTS)
+    assert app.state.runtime.discovered_routes == {
+        ("POST", "/v1/analyze"),
+        ("POST", "/v2/protect"),
+        ("POST", "/v1/azure/language/:analyze-text"),
+    }
+    catalog = (await client.get("/api/explorer/catalog", headers=headers)).json()["operations"]
+    assert catalog[0]["group"] == "ShinrAI native API v2"
+    by_id = {item["id"]: item for item in catalog}
+    assert by_id["v2.protect"]["availability"] == "available"
+    assert by_id["azure.sync"]["availability"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_connect_falls_back_to_v1_when_the_deployment_has_no_v2(local):
+    _, client, headers = local
+    response = await client.post(
+        "/api/settings/shinrai",
+        headers=headers,
+        json={"base_url": "https://legacy.shinrai.example", "api_key": "shinrai-secret"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["native_api"] == "v1"
     assert body["capabilities"]["tiers"]["realtime"]["allowed"] is False
-    assert body["usage"]["balances"]["available_records"] == 42.5
-    assert app.state.runtime.discovered_routes == {("POST", "/v1/analyze")}
+    assert (await client.get("/api/bootstrap", headers=headers)).json()["native_api"] == "v1"
+    refused = await client.post("/api/text", headers=headers, json={"text": "Ada Lovelace", "api": "v2"})
+    assert refused.status_code == 422 and "does not serve the native API v2" in refused.json()["detail"]
+    legacy = await client.post("/api/text", headers=headers, json={"text": "Ada Lovelace", "api": "v1"})
+    assert legacy.status_code == 200
+    assert REMOTE_REQUESTS[-1].url.path == "/v1/redact/batch"
+
+
+@pytest.mark.asyncio
+async def test_connect_stays_on_v2_when_only_usage_is_not_metered(local):
+    _, client, headers = local
+    response = await client.post(
+        "/api/settings/shinrai",
+        headers=headers,
+        json={"base_url": "https://local.shinrai.example", "api_key": "shinrai-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["native_api"] == "v2" and response.json()["usage"] is None
+    assert not any(request.url.path.startswith("/v1/") for request in REMOTE_REQUESTS)
 
 
 @pytest.mark.asyncio
@@ -239,12 +511,14 @@ async def test_text_trace_is_private_locally_and_safe_when_exported(local):
         },
     )
     assert response.status_code == 200
+    assert response.json()["result"]["results"][0]["output"] == "[PERSON_1] uses [EMAIL_1]"
     traces = (await client.get("/api/traces", headers=headers)).json()["traces"]
-    assert traces[0]["response"]["mapping"]["Ada Lovelace"] == "[PERSON_1]"
+    assert traces[0]["destination"] == "https://api.shinrai.example/v2/protect"
+    assert traces[0]["response"]["mapping"]["delta"][0]["original"] == "Ada Lovelace"
     safe = (await client.get("/api/traces/export", headers=headers)).json()
     assert safe["traces"][0]["response"]["mapping"] == "[omitted from safe export]"
     full = (await client.get("/api/traces/export?include_sensitive=true", headers=headers)).json()
-    assert full["traces"][0]["response"]["mapping"]["Ada Lovelace"] == "[PERSON_1]"
+    assert full["traces"][0]["response"]["mapping"]["delta"][0]["replacement"] == "[PERSON_1]"
 
 
 @pytest.mark.asyncio
@@ -326,25 +600,84 @@ async def test_protection_failure_stops_before_model_provider(local):
     assert not any(request.url.host == "llm.example" for request in REMOTE_REQUESTS)
 
 
-@pytest.mark.asyncio
-async def test_attachment_uses_protected_artifacts_and_filename_never_reaches_llm(local):
-    app, client, headers = local
+def connect_chat(app) -> None:
     connection = app.state.runtime.connection
     connection.shinrai_url = "https://api.shinrai.example"
     connection.shinrai_key = "shinrai-secret"
     connection.llm_inference_url = "https://llm.example/v1/chat/completions"
     connection.llm_key = "llm-secret"
     connection.llm_model = "model-a"
+
+
+def v2_bodies(path: str) -> list[dict]:
+    return [json.loads(request.content) for request in REMOTE_REQUESTS if request.url.path == path]
+
+
+@pytest.mark.asyncio
+async def test_text_file_uses_v2_protect_and_its_mapping(local):
+    app, client, headers = local
+    connect_chat(app)
     uploaded = await client.post(
         "/api/files",
         headers=headers,
         files={"file": ("customer-secret.txt", b"Ada Lovelace uses ada@example.org", "text/plain")},
         data={"mode": "replace"},
     )
-    assert uploaded.status_code == 200
+    assert uploaded.status_code == 200, uploaded.text
     attachment = uploaded.json()["attachment"]
-    assert attachment["cleanup"] == "deleted"
-    assert attachment["pages"] == 1
+    assert attachment["api"] == "v2" and attachment["pages"] == 0
+    assert attachment["protected_text"] == "[PERSON_1] uses [EMAIL_1]"
+    assert attachment["downloads"] == ["text", "mapping"]
+    sent = v2_bodies("/v2/protect")[0]
+    assert sent["policy"] == {"preset": "pseudonymize"} and sent["inputs"][0]["kind"] == "text"
+    assert not any(request.url.path.startswith("/v1/") for request in REMOTE_REQUESTS)
+    mapping = await client.get(f"/api/attachments/{attachment['id']}/download/mapping", headers=headers)
+    assert {"original": "Ada Lovelace", "replacement": "[PERSON_1]"} in mapping.json()["mapping"]["known"]
+    assert (await client.get(f"/api/attachments/{attachment['id']}/download/pdf", headers=headers)).status_code == 404
+    response = await client.post(
+        "/api/chat",
+        headers=headers,
+        json={
+            "text": "Summarize Ada Lovelace",
+            "attachment_ids": [attachment["id"]],
+            "stream": False,
+            "tier": "standard",
+        },
+    )
+    assert json.loads(response.text.splitlines()[-1])["type"] == "complete"
+    outgoing = next(request for request in REMOTE_REQUESTS if request.url.host == "llm.example").content.decode()
+    assert "customer-secret" not in outgoing and "Ada Lovelace" not in outgoing and "ada@example.org" not in outgoing
+    assert (await client.delete(f"/api/attachments/{attachment['id']}", headers=headers)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_image_uses_v2_protect_with_filled_image_boxes_and_protected_visuals(local):
+    app, client, headers = local
+    connect_chat(app)
+    uploaded = await client.post(
+        "/api/files",
+        headers=headers,
+        # The browser label is wrong on purpose: the app sends the media type of the encoded image.
+        files={"file": ("customer-secret.jpg", image_bytes("JPEG"), "image/png")},
+        data={"mode": "replace", "language": "de"},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    attachment = uploaded.json()["attachment"]
+    sent = v2_bodies("/v2/protect")[0]
+    assert sent["inputs"][0]["kind"] == "image" and sent["inputs"][0]["media_type"] == "image/jpeg"
+    assert sent["output"]["include_text"] is True and "redaction_plan" in sent["output"]["include"]
+    assert sent["detection"] == {"language": "de"}
+    assert attachment["pages"] == 1 and attachment["entities"] == 2
+    assert attachment["protected_text"] == "Contact [PERSON_1] at [EMAIL_1]."
+    assert attachment["downloads"] == ["text", "image", "mapping"]
+    image = await client.get(f"/api/attachments/{attachment['id']}/download/image", headers=headers)
+    assert image.content.startswith(b"\x89PNG")
+    assert Image.open(io.BytesIO(image.content)).getpixel((5, 5)) == (0, 0, 0)  # ShinrAI's filled output
+    traces = (await client.get("/api/traces", headers=headers)).json()["traces"]
+    shown = json.dumps(traces[0])
+    assert "base64 characters" in shown and "image bytes" in shown
+    safe = json.dumps((await client.get("/api/traces/export", headers=headers)).json())
+    assert OCR_TEXT not in safe
     response = await client.post(
         "/api/chat",
         headers=headers,
@@ -357,17 +690,77 @@ async def test_attachment_uses_protected_artifacts_and_filename_never_reaches_ll
             "tier": "standard",
         },
     )
-    assert response.status_code == 200
-    llm_request = next(request for request in REMOTE_REQUESTS if request.url.host == "llm.example")
-    outgoing = llm_request.content.decode()
-    assert "customer-secret.txt" not in outgoing
-    assert "Ada Lovelace" not in outgoing
-    assert "ada@example.org" not in outgoing
+    assert json.loads(response.text.splitlines()[-1])["type"] == "complete"
+    outgoing = next(request for request in REMOTE_REQUESTS if request.url.host == "llm.example").content.decode()
     assert "data:image/png;base64," in outgoing
-    text_download = await client.get(f"/api/attachments/{attachment['id']}/download/text", headers=headers)
+    assert "customer-secret" not in outgoing and "Ada Lovelace" not in outgoing and "ada@example.org" not in outgoing
+
+
+@pytest.mark.asyncio
+async def test_pdf_uses_v2_upload_and_document_job_then_deletes_it(local):
+    app, client, headers = local
+    connect_chat(app)
+    pdf = protected_pdf()
+    uploaded = await client.post(
+        "/api/files",
+        headers=headers,
+        files={"file": ("customer-secret.pdf", pdf, "application/pdf")},
+        data={"mode": "label"},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    attachment = uploaded.json()["attachment"]
+    upload = next(request for request in REMOTE_REQUESTS if request.url.path == "/v2/uploads")
+    assert upload.content == pdf and upload.headers["content-type"] == "application/pdf"
+    job = v2_bodies("/v2/jobs")[0]
+    assert job["kind"] == "document" and job["policy"] == {"preset": "label"}
+    assert job["output"] == {"artifacts": ["protected", "entities", "mapping"]}
+    assert job["inputs"][0]["media_type"] == "application/pdf"
+    assert ("DELETE", f"/v2/jobs/{V2_JOB_ID}") in {(request.method, request.url.path) for request in REMOTE_REQUESTS}
+    assert not any(request.url.path.startswith("/v1/") for request in REMOTE_REQUESTS)
+    assert attachment["protected_text"] == "Contact [PERSON_1] at [EMAIL_1]."
+    assert attachment["cleanup"] == "deleted (job, upload and artifacts)"
+    assert attachment["has_mapping"] is True and attachment["entities"] == 1 and attachment["pages"] == 0
+    assert app.state.runtime.attachments[attachment["id"]].mapping == {
+        "Ada Lovelace": "[PERSON_1]",
+        "ada@example.org": "[EMAIL_1]",
+    }
+
+
+@pytest.mark.asyncio
+async def test_v2_document_jobs_are_refused_before_upload_when_not_served(local):
+    app, client, headers = local
+    connect_chat(app)
+    app.state.runtime.native_api = "v2"
+    app.state.runtime.capabilities = {"inputs": {"text": {"standard": "ga", "realtime": "ga", "jobs": "beta"}}}
+    response = await client.post(
+        "/api/files",
+        headers=headers,
+        files={"file": ("letter.docx", b"PK\x03\x04synthetic", "application/octet-stream")},
+    )
+    assert response.status_code == 422 and "API v1 · redacted PDF" in response.json()["detail"]
+    assert not REMOTE_REQUESTS
+
+
+@pytest.mark.asyncio
+async def test_v1_document_option_keeps_the_flattened_redacted_pdf(local):
+    app, client, headers = local
+    connect_chat(app)
+    uploaded = await client.post(
+        "/api/files",
+        headers=headers,
+        files={"file": ("customer-secret.txt", b"Ada Lovelace uses ada@example.org", "text/plain")},
+        data={"mode": "replace", "api": "v1"},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    attachment = uploaded.json()["attachment"]
+    assert attachment["api"] == "v1" and attachment["cleanup"] == "deleted" and attachment["pages"] == 1
+    assert attachment["downloads"] == ["text", "pdf", "mapping"]
+    assert REMOTE_REQUESTS[0].url.path == "/v1/documents/jobs"
     pdf_download = await client.get(f"/api/attachments/{attachment['id']}/download/pdf", headers=headers)
-    assert text_download.text == "Contact [PERSON_1] at [EMAIL_1]."
+    text_download = await client.get(f"/api/attachments/{attachment['id']}/download/text", headers=headers)
     assert pdf_download.content.startswith(b"%PDF")
+    assert text_download.text == "Contact [PERSON_1] at [EMAIL_1]."
+    assert (await client.get(f"/api/attachments/{attachment['id']}/preview/1", headers=headers)).status_code == 200
     assert (await client.delete(f"/api/attachments/{attachment['id']}", headers=headers)).status_code == 200
     assert (await client.get(f"/api/attachments/{attachment['id']}/preview/1", headers=headers)).status_code == 404
 
@@ -483,3 +876,137 @@ async def test_explorer_downloads_binary_without_putting_it_in_trace_json(local)
     traces = (await client.get("/api/traces", headers=headers)).json()["traces"]
     assert traces[0]["response"]["binary"] is True
     assert traces[0]["response"]["bytes"] == len(response.content)
+
+
+@pytest.mark.asyncio
+async def test_text_workspace_sends_native_v2_request_shapes(local):
+    app, client, headers = local
+    connect_chat(app)
+    detect = await client.post("/api/text", headers=headers, json={"operation": "analyze", "text": "Ada Lovelace"})
+    assert detect.status_code == 200, detect.text
+    assert detect.json()["result"]["results"][0]["entities"][0]["span"] == {"start": 0, "end": 12}
+    batch = await client.post(
+        "/api/text",
+        headers=headers,
+        json={
+            "operation": "batch",
+            "text": "Ada Lovelace\n---\nMail ada@example.org",
+            "mode": "label",
+            "tier": "realtime",
+            "threshold": 0.4,
+            "language": "en",
+            "model": "shinrai-latest",
+        },
+    )
+    assert batch.status_code == 200, batch.text
+    detect_body, protect_body = v2_bodies("/v2/detect")[0], v2_bodies("/v2/protect")[0]
+    assert detect_body == {
+        "text": "Ada Lovelace",
+        "detection": {"model": "latest"},
+        "processing": {"tier": "standard"},
+        "output": {"include": ["entities"]},
+    }
+    assert protect_body["texts"] == ["Ada Lovelace", "Mail ada@example.org"]
+    assert protect_body["policy"] == {"preset": "label"}
+    assert protect_body["output"] == {"include": ["entities", "mapping"]}
+    assert protect_body["detection"] == {"model": "latest", "thresholds": {"default": 0.4}, "language": "en"}
+    assert protect_body["processing"] == {"tier": "realtime"}
+    assert [row["output"] for row in batch.json()["result"]["results"]] == ["[PERSON_1]", "Mail [EMAIL_1]"]
+    assert not any(request.url.path.startswith("/v1/") for request in REMOTE_REQUESTS)
+    bad = await client.post("/api/text", headers=headers, json={"text": "Ada", "language": "German"})
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_text_restore_runs_locally_or_through_v2_restore(local):
+    app, client, headers = local
+    connect_chat(app)
+    missing = await client.post("/api/text", headers=headers, json={"operation": "restore", "text": "[PERSON_1]"})
+    assert missing.status_code == 422
+    protected = await client.post("/api/text", headers=headers, json={"text": "Ada Lovelace uses ada@example.org"})
+    assert protected.status_code == 200
+    calls = len(REMOTE_REQUESTS)
+    local_restore = await client.post(
+        "/api/text", headers=headers, json={"operation": "restore", "text": "Reply to [PERSON_1] at [EMAIL_1]."}
+    )
+    assert local_restore.status_code == 200
+    assert local_restore.json()["result"]["results"][0]["text"] == "Reply to Ada Lovelace at ada@example.org."
+    assert len(REMOTE_REQUESTS) == calls  # nothing left the computer
+    remote = await client.post(
+        "/api/text", headers=headers, json={"operation": "restore-remote", "text": "Reply to [PERSON_1]."}
+    )
+    assert remote.status_code == 200
+    assert remote.json()["result"]["results"][0]["text"] == "Reply to Ada Lovelace."
+    sent = v2_bodies("/v2/restore")[0]
+    assert {"original": "Ada Lovelace", "replacement": "[PERSON_1]"} in sent["mapping"]["known"]
+    assert sent["inputs"] == [{"id": "1", "text": "Reply to [PERSON_1]."}]
+    safe = json.dumps((await client.get("/api/traces/export", headers=headers)).json())
+    assert "Reply to Ada Lovelace" not in safe
+
+
+@pytest.mark.asyncio
+async def test_text_workspace_keeps_a_v1_option(local):
+    app, client, headers = local
+    connect_chat(app)
+    detect = await client.post("/api/text", headers=headers, json={"operation": "analyze", "text": "Ada", "api": "v1"})
+    protect = await client.post(
+        "/api/text", headers=headers, json={"text": "Ada Lovelace", "api": "v1", "model": "latest"}
+    )
+    assert detect.status_code == protect.status_code == 200
+    analyze_body = json.loads(next(r for r in REMOTE_REQUESTS if r.url.path == "/v1/analyze").content)
+    assert analyze_body["model"] == "shinrai-latest" and analyze_body["threshold"] == 0.7
+    assert protect.json()["result"]["results"][0]["text"] == "[PERSON_1]"
+    assert app.state.runtime.text_mapping == {"Ada Lovelace": "[PERSON_1]", "ada@example.org": "[EMAIL_1]"}
+    assert not any(request.url.path.startswith("/v2/") for request in REMOTE_REQUESTS)
+
+
+@pytest.mark.asyncio
+async def test_chat_sends_earlier_pairs_as_mapping_known_so_surrogates_stay(local):
+    app, client, headers = local
+    connect_chat(app)
+    first = await client.post(
+        "/api/chat", headers=headers, json={"text": "Email Ada Lovelace at ada@example.org", "stream": False}
+    )
+    second = await client.post(
+        "/api/chat", headers=headers, json={"text": "Remind Ada Lovelace tomorrow", "stream": False}
+    )
+    assert (
+        json.loads(first.text.splitlines()[-1])["type"]
+        == json.loads(second.text.splitlines()[-1])["type"]
+        == "complete"
+    )
+    turn_one, turn_two = v2_bodies("/v2/protect")
+    assert "mapping" not in turn_one and turn_one["processing"] == {"tier": "realtime"}
+    assert turn_one["policy"] == {"preset": "pseudonymize"}
+    assert {"original": "Ada Lovelace", "replacement": "[PERSON_1]"} in turn_two["mapping"]["known"]
+    assert "[PERSON_1]" in turn_two["mapping"]["reserved"]
+    # History, reply and new prompt are protected together; every Ada is still [PERSON_1].
+    assert [item["text"] for item in turn_two["inputs"]][-1] == "Remind Ada Lovelace tomorrow"
+    outgoing = [request for request in REMOTE_REQUESTS if request.url.host == "llm.example"][-1].content.decode()
+    assert "[PERSON_1]" in outgoing and "[PERSON_2]" not in outgoing
+    assert app.state.runtime.chat.messages[-1]["content"] == "I emailed Ada Lovelace at ada@example.org."
+    trace = (await client.get("/api/traces", headers=headers)).json()["traces"][0]
+    assert trace["shinrai"]["endpoint"] == "/v2/protect"
+    safe = (await client.get("/api/traces/export", headers=headers)).json()["traces"][0]
+    assert safe["shinrai"]["request"]["mapping"] == "[omitted from safe export]"
+    assert safe["shinrai"]["request"]["original_inputs"] == "[omitted from safe export]"
+
+
+@pytest.mark.asyncio
+async def test_explorer_runs_native_v2_operations(local):
+    app, client, headers = local
+    connect_chat(app)
+    detect = await client.post("/api/explorer/run", headers=headers, json={"operation_id": "v2.detect"})
+    restore = await client.post("/api/explorer/run", headers=headers, json={"operation_id": "v2.restore"})
+    poll = await client.post(
+        "/api/explorer/run", headers=headers, json={"operation_id": "v2.job-poll", "path": f"/v2/jobs/{V2_JOB_ID}"}
+    )
+    assert detect.status_code == restore.status_code == poll.status_code == 200
+    assert detect.json()["result"]["results"][0]["entities"]
+    assert restore.json()["result"]["results"][0]["text"] == "Ada Lovelace replied."
+    assert poll.json()["result"]["status"] == "succeeded"
+    assert [request.headers["authorization"] for request in REMOTE_REQUESTS] == ["Bearer shinrai-secret"] * 3
+    escaped = await client.post(
+        "/api/explorer/run", headers=headers, json={"operation_id": "v2.job-poll", "path": "/v2/jobs/a/b"}
+    )
+    assert escaped.status_code == 403

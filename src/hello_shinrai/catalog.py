@@ -2,10 +2,173 @@ from __future__ import annotations
 
 from typing import Any
 
+from .client import vendor_path
+
+V2 = "ShinrAI native API v2"
+V1 = "ShinrAI native v1 (legacy)"
+SAMPLE = "Email Ada Lovelace at ada@example.org. She lives in London."
+
+# The native API v2 comes first; v1 and the vendor compatibility surfaces follow.
+NATIVE_V2: list[dict[str, Any]] = [
+    {
+        "id": "v2.detect",
+        "group": V2,
+        "name": "Detect personal data",
+        "method": "POST",
+        "path": "/v2/detect",
+        "auth": "bearer",
+        "body": {"text": SAMPLE, "language": "en"},
+    },
+    {
+        "id": "v2.protect",
+        "group": V2,
+        "name": "Protect text (pseudonymize, keep the mapping)",
+        "method": "POST",
+        "path": "/v2/protect",
+        "auth": "bearer",
+        "body": {
+            "text": SAMPLE,
+            "policy": {"preset": "pseudonymize"},
+            "output": {"include": ["entities", "mapping"]},
+        },
+    },
+    {
+        "id": "v2.protect-batch",
+        "group": V2,
+        "name": "Protect several texts with one map",
+        "method": "POST",
+        "path": "/v2/protect",
+        "auth": "bearer",
+        "body": {
+            "texts": ["Ada Lovelace lives in London.", "Email Ada Lovelace at ada@example.org."],
+            "policy": {"preset": "label"},
+            "output": {"include": ["entities", "mapping"]},
+        },
+    },
+    {
+        "id": "v2.protect-known",
+        "group": V2,
+        "name": "Protect with earlier pairs (mapping.known)",
+        "method": "POST",
+        "path": "/v2/protect",
+        "auth": "bearer",
+        "body": {
+            "text": "Ada Lovelace called again from London.",
+            "mapping": {"known": [{"original": "Ada Lovelace", "replacement": "Grace Palmer"}]},
+            "output": {"include": ["entities", "mapping"]},
+        },
+    },
+    {
+        "id": "v2.restore",
+        "group": V2,
+        "name": "Restore surrogates (free)",
+        "method": "POST",
+        "path": "/v2/restore",
+        "auth": "bearer",
+        "body": {
+            "mapping": {"known": [{"original": "Ada Lovelace", "replacement": "Grace Palmer"}]},
+            "inputs": [{"id": "1", "text": "Grace Palmer replied."}],
+        },
+    },
+    {
+        "id": "v2.capabilities",
+        "group": V2,
+        "name": "Capabilities, tiers and limits",
+        "method": "GET",
+        "path": "/v2/capabilities",
+        "auth": "bearer",
+        "body": None,
+    },
+    {
+        "id": "v2.types",
+        "group": V2,
+        "name": "Entity types and vendor vocabularies",
+        "method": "GET",
+        "path": "/v2/types",
+        "auth": "bearer",
+        "body": None,
+    },
+    {
+        "id": "v2.usage",
+        "group": V2,
+        "name": "Balance and last 30 days",
+        "method": "GET",
+        "path": "/v2/usage",
+        "auth": "bearer",
+        "body": None,
+    },
+    {
+        "id": "v2.job-create",
+        "group": V2,
+        "name": "Start a text batch job",
+        "method": "POST",
+        "path": "/v2/jobs",
+        "auth": "bearer",
+        "body": {
+            "kind": "text_batch",
+            "inputs": [
+                {"id": "1", "kind": "text", "text": "Ada Lovelace lives in London."},
+                {"id": "2", "kind": "text", "text": "Email ada@example.org."},
+            ],
+            "output": {"artifacts": ["protected", "entities"]},
+        },
+    },
+    {
+        "id": "v2.job-list",
+        "group": V2,
+        "name": "List jobs",
+        "method": "GET",
+        "path": "/v2/jobs",
+        "auth": "bearer",
+        "body": None,
+    },
+    {
+        "id": "v2.job-poll",
+        "group": V2,
+        "name": "Poll a job",
+        "method": "GET",
+        "path": "/v2/jobs/{job_id}",
+        "auth": "bearer",
+        "body": None,
+        "requires": "Replace {job_id}",
+    },
+    {
+        "id": "v2.job-artifact",
+        "group": V2,
+        "name": "Download a job artifact",
+        "method": "GET",
+        "path": "/v2/jobs/{job_id}/artifacts/{name}",
+        "auth": "bearer",
+        "body": None,
+        "requires": "Replace {job_id} and {name} (protected, entities, or mapping)",
+    },
+    {
+        "id": "v2.job-cancel",
+        "group": V2,
+        "name": "Cancel a job",
+        "method": "POST",
+        "path": "/v2/jobs/{job_id}/cancel",
+        "auth": "bearer",
+        "body": None,
+        "requires": "Replace {job_id}",
+    },
+    {
+        "id": "v2.job-delete",
+        "group": V2,
+        "name": "Delete a job, its upload and artifacts",
+        "method": "DELETE",
+        "path": "/v2/jobs/{job_id}",
+        "auth": "bearer",
+        "body": None,
+        "requires": "Replace {job_id}",
+    },
+]
+
 OPERATIONS: list[dict[str, Any]] = [
+    *NATIVE_V2,
     {
         "id": "native.models",
-        "group": "ShinrAI native",
+        "group": V1,
         "name": "Models and tier access",
         "method": "GET",
         "path": "/v1/models",
@@ -14,7 +177,7 @@ OPERATIONS: list[dict[str, Any]] = [
     },
     {
         "id": "native.usage",
-        "group": "ShinrAI native",
+        "group": V1,
         "name": "Usage and balances",
         "method": "GET",
         "path": "/v1/usage",
@@ -23,7 +186,7 @@ OPERATIONS: list[dict[str, Any]] = [
     },
     {
         "id": "native.analyze",
-        "group": "ShinrAI native",
+        "group": V1,
         "name": "Analyze text",
         "method": "POST",
         "path": "/v1/analyze",
@@ -32,7 +195,7 @@ OPERATIONS: list[dict[str, Any]] = [
     },
     {
         "id": "native.redact",
-        "group": "ShinrAI native",
+        "group": V1,
         "name": "Protect text",
         "method": "POST",
         "path": "/v1/redact",
@@ -46,7 +209,7 @@ OPERATIONS: list[dict[str, Any]] = [
     },
     {
         "id": "native.batch",
-        "group": "ShinrAI native",
+        "group": V1,
         "name": "Consistent batch protection",
         "method": "POST",
         "path": "/v1/redact/batch",
@@ -243,7 +406,7 @@ OPERATIONS.extend(
     [
         {
             "id": "native.document-poll",
-            "group": "ShinrAI native",
+            "group": V1,
             "name": "Poll document job",
             "method": "GET",
             "path": "/v1/documents/jobs/{identifier}",
@@ -253,7 +416,7 @@ OPERATIONS.extend(
         },
         {
             "id": "native.document-cancel",
-            "group": "ShinrAI native",
+            "group": V1,
             "name": "Cancel and delete document job",
             "method": "DELETE",
             "path": "/v1/documents/jobs/{identifier}",
@@ -263,7 +426,7 @@ OPERATIONS.extend(
         },
         {
             "id": "native.document-download",
-            "group": "ShinrAI native",
+            "group": V1,
             "name": "Download document artifact",
             "method": "GET",
             "path": "/v1/documents/jobs/{identifier}/artifacts/{kind}",
@@ -460,8 +623,9 @@ def public_catalog(discovered: set[tuple[str, str]]) -> list[dict[str, Any]]:
             row["availability"] = "catalogued"
         elif not discovered:
             row["availability"] = "not yet verified"
-        elif (row["method"], row["path"]) in discovered or any(
-            route_method == row["method"] and template_matches(route, row["path"]) for route_method, route in discovered
+        elif any(
+            route_method == row["method"] and template_matches(route, vendor_path(row["path"]))
+            for route_method, route in discovered
         ):
             row["availability"] = "available"
         else:
