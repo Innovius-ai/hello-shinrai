@@ -38,11 +38,10 @@
           <span class="step-badge">ShinrAI key only</span>
         </div>
         <form id="text-form" class="surface">
-          <div class="field-row four">
+          <div class="field-row three">
             <label>Operation<select id="text-operation"><option value="redact">Protect text</option><option value="analyze">Detect only</option><option value="batch">Consistent batch</option><option value="restore">Restore locally</option><option value="restore-remote">Restore via /v2/restore</option></select></label>
             <label>Mode<select id="text-mode"><option value="replace">Pseudonymize</option><option value="mask">Mask</option><option value="label">Label</option></select></label>
             <label>Tier<select id="text-tier"><option value="standard">Standard</option><option value="batch">Batch</option><option value="realtime">Real-time · fast</option></select></label>
-            <label>API<select id="text-api"><option value="v2">Native v2</option><option value="v1">Native v1 (legacy)</option></select></label>
           </div>
           <label class="block-label">Input<textarea id="text-input" rows="8">Please send the contract to Ada Lovelace at ada@example.org. Her office is at 12 Analytical Engine Way, London.</textarea></label>
           <p class="hint" id="batch-hint">For a batch, separate texts with a line containing <code>---</code>. Restore uses the replacement map of your last Pseudonymize or Label run.</p>
@@ -53,11 +52,11 @@
       </section>
 
       <section class="panel" id="panel-files" aria-labelledby="tab-files-title">
-        <div class="panel-heading"><div><p class="eyebrow">Documents and scans</p><h1 id="tab-files-title">Protect a file</h1><p>TXT, PDF, DOCX, PNG, JPEG, and BMP. Nothing goes to an LLM yet. API v2 fills detected text in images and returns protected text for documents.</p></div><span class="step-badge">10 MB maximum</span></div>
+        <div class="panel-heading"><div><p class="eyebrow">Documents and scans</p><h1 id="tab-files-title">Protect a file</h1><p>TXT, PDF, DOCX, PNG, JPEG, and BMP. Nothing goes to an LLM yet. Images come back with detected text filled. Documents come back as a redacted PDF with page previews and the protected text.</p></div><span class="step-badge">10 MB maximum</span></div>
         <form id="file-form" class="surface upload-surface">
           <label class="dropzone" id="dropzone"><input id="file-input" type="file" accept=".txt,.pdf,.docx,.png,.jpg,.jpeg,.bmp" required><span class="drop-icon">＋</span><strong>Choose a file</strong><small>or drop it here</small></label>
-          <div class="field-row three"><label>Protection mode<select id="file-mode"><option value="replace">Pseudonymize</option><option value="mask">Mask</option><option value="label">Label</option></select></label><label>Output<select id="file-api"><option value="v2">API v2 · text and images</option><option value="v1">API v1 · redacted PDF</option></select></label><label>Language<input id="file-language" value="auto" spellcheck="false"></label></div>
-          <p class="hint" id="file-api-hint">API v2: text files and images use <code>/v2/protect</code> (images come back with detected text filled). PDF and DOCX run as a <code>/v2/jobs</code> document job that returns protected text.</p>
+          <div class="field-row two"><label>Protection mode<select id="file-mode"><option value="replace">Pseudonymize</option><option value="mask">Mask</option><option value="label">Label</option></select></label><label>Language<input id="file-language" value="auto" spellcheck="false"></label></div>
+          <p class="hint" id="file-hint">Text files and images use <code>/v2/protect</code>. PDF and DOCX run as a <code>/v2/jobs</code> document job. The job returns the redacted PDF, the protected text, the findings, and the replacement map.</p>
           <div class="actions"><button class="button primary" type="submit">Protect file</button><span class="run-status" id="file-status"></span></div>
         </form>
         <div id="attachment-list" class="attachment-list"></div>
@@ -95,7 +94,7 @@
       </section>
 
       <section class="panel" id="panel-explorer" aria-labelledby="tab-explorer-title">
-        <div class="panel-heading"><div><p class="eyebrow">Admin workbench</p><h1 id="tab-explorer-title">API explorer</h1><p>Native API v2 operations come first, then v1 and the Azure, AWS, and Google compatibility routes. Only reviewed processing routes and safe routes discovered from OpenAPI are callable.</p></div><span class="step-badge">No automatic retry</span></div>
+        <div class="panel-heading"><div><p class="eyebrow">Admin workbench</p><h1 id="tab-explorer-title">API explorer</h1><p>Native API v2 operations come first, then the Azure, AWS, and Google compatibility routes. Only reviewed processing routes and safe routes discovered from OpenAPI are callable.</p></div><span class="step-badge">No automatic retry</span></div>
         <form id="explorer-form" class="surface">
           <label class="block-label">Operation<select id="explorer-operation"></select></label>
           <div class="operation-meta" id="operation-meta"></div>

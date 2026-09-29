@@ -32,17 +32,20 @@ DOCUMENT_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 UPLOAD_TYPES = {TEXT_TYPE, "image/png", "image/jpeg", "image/bmp", *DOCUMENT_TYPES}
+# Document jobs: `protected` is the redacted PDF and `text` the protected text. Deployments that
+# predate the redacted PDF refuse `text` and answer `protected` with the protected text.
+DOCUMENT_ARTIFACTS = ("protected", "text", "entities")
+TEXT_ONLY_DOCUMENT_ARTIFACTS = ("protected", "entities")
+NO_API_V2 = (
+    "This deployment does not serve the ShinrAI API v2 (GET /v2/capabilities answered {status}). "
+    "Hello ShinrAI 0.2 needs API v2: use the hosted API or an offline release that serves API v2."
+)
 
 
 def v2_model(value: str | None) -> str:
-    """v2 names models `latest` or `vX.Y`; the v1 alias `shinrai-latest` means `latest`."""
+    """v2 names models `latest` or `vX.Y`; the older alias `shinrai-latest` means `latest`."""
     value = (value or "").strip()
     return "latest" if value in {"", "latest", "shinrai-latest"} else value
-
-
-def v1_model(value: str | None) -> str:
-    value = (value or "").strip()
-    return "shinrai-latest" if value in {"", "latest", "shinrai-latest"} else value
 
 
 def v2_options(
@@ -68,9 +71,7 @@ def known_block(pairs: dict[str, str]) -> dict[str, Any]:
 
 
 def reversible_pairs(entries: Any) -> dict[str, str]:
-    """Restorable original -> replacement pairs from a v2 `mapping.delta` (or a v1 mapping object)."""
-    if isinstance(entries, dict):
-        entries = [{"original": key, "replacement": value} for key, value in entries.items()]
+    """Restorable original -> replacement pairs from a v2 `mapping.delta`."""
     return merge_pairs({}, entries if isinstance(entries, list) else [])
 
 
@@ -135,6 +136,35 @@ def trace_view(body: Any) -> Any:
             if isinstance(entity, dict) and "text" in entity:
                 entity["original"] = entity.pop("text")
     return view
+
+
+def entities_view(body: Any) -> Any:
+    """An `entities` artifact for the trace: the original value of each entity under an omitted key."""
+    if not isinstance(body, dict) or not isinstance(body.get("entities"), list):
+        return body
+    view = copy.deepcopy(body)
+    for entity in view["entities"]:
+        if isinstance(entity, dict) and "text" in entity:
+            entity["original"] = entity.pop("text")
+    return view
+
+
+def refuses_text_artifact(exc: RemoteError) -> bool:
+    """True when a deployment refused the requested artifacts before it created the job."""
+    if exc.status not in {422, 501} or not isinstance(exc.body, dict):
+        return False
+    error = exc.body.get("error")
+    details = error.get("details") if isinstance(error, dict) else None
+    return any(
+        isinstance(item, dict) and str(item.get("pointer", "")).startswith("/output/artifacts")
+        for item in details or []
+    )
+
+
+def text_of(body: Any) -> str | None:
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace")
+    return body if isinstance(body, str) else None
 
 
 def vendor_path(path: str) -> str:
@@ -239,32 +269,29 @@ class ShinraiClient:
         async with httpx.AsyncClient() as client:
             return await send(client)
 
-    async def connect(self) -> tuple[Result, Result, set[tuple[str, str]], str]:
-        """Capabilities and usage from API v2. A deployment without v2 (404/501) falls back to v1."""
+    async def connect(self) -> tuple[Result, Result, set[tuple[str, str]]]:
+        """Capabilities and usage from API v2. A deployment without API v2 (404/501) is refused."""
         capabilities, usage = await asyncio.gather(
             self.request("GET", "/v2/capabilities"), self.request("GET", "/v2/usage"), return_exceptions=True
         )
         if isinstance(capabilities, RemoteError) and capabilities.status in {404, 501}:
-            capabilities, usage = await asyncio.gather(
-                self.request("GET", "/v1/models"), self.request("GET", "/v1/usage")
+            raise RemoteError(
+                NO_API_V2.format(status=capabilities.status), status=capabilities.status, body=capabilities.body
             )
-            api = "v1"
-        else:
-            if isinstance(capabilities, BaseException):
-                raise capabilities
-            if isinstance(usage, RemoteError) and usage.status in {404, 501}:
-                # Local-mode deployments meter nothing: /v2/usage is optional there.
-                usage = Result(usage.status, None, {}, 0)
-            elif isinstance(usage, BaseException):
-                raise usage
-            api = "v2"
+        if isinstance(capabilities, BaseException):
+            raise capabilities
+        if isinstance(usage, RemoteError) and usage.status in {404, 501}:
+            # Local-mode deployments meter nothing: /v2/usage is optional there.
+            usage = Result(usage.status, None, {}, 0)
+        elif isinstance(usage, BaseException):
+            raise usage
         routes: set[tuple[str, str]] = set()
         try:
             schema = await self.request("GET", "/openapi.json", timeout=30)
             routes = safe_schema_routes(schema.body)
         except (RemoteError, ValueError, TypeError):
             pass
-        return capabilities, usage, routes, api
+        return capabilities, usage, routes
 
     async def protect_texts(
         self,
@@ -314,7 +341,7 @@ class ShinraiClient:
         else:
             media_type = image_media_type(content)
             if len(content) > V2_IMAGE_MAX_BYTES:
-                raise ValueError("API v2 accepts images up to 6 MiB. Choose the v1 document job for larger scans.")
+                raise ValueError("API v2 accepts images up to 6 MiB. Send larger scans as a PDF document job.")
             item = {
                 "id": "1",
                 "kind": "image",
@@ -347,7 +374,6 @@ class ShinraiClient:
             ocr_text = row.get("text") if isinstance(row.get("text"), str) else ""
             protected_text = apply_replacements(ocr_text, entities)
         return {
-            "api": "v2",
             "job_id": "",
             "job": None,
             "text": protected_text,
@@ -365,14 +391,19 @@ class ShinraiClient:
     async def document_v2(
         self, content: bytes, content_type: str, *, mode: str = "replace", language: str | None = None
     ) -> dict[str, Any]:
-        """PDF or DOCX: POST /v2/uploads, POST /v2/jobs (kind document), poll, download, DELETE the job."""
+        """PDF or DOCX: POST /v2/uploads, POST /v2/jobs (kind document), poll, download, DELETE the job.
+
+        The job returns the redacted PDF (`protected`) and the protected text (`text`). A deployment
+        without the redacted PDF refuses `text` before it creates a job; the app then submits once
+        more without `text` and receives the protected text as `protected`.
+        """
         uploaded = await self.request("POST", "/v2/uploads", content=content, headers={"Content-Type": content_type})
         upload_id = str(uploaded.body.get("id", "")) if isinstance(uploaded.body, dict) else ""
         if not V2_ID.fullmatch(upload_id):
             raise RemoteError("ShinrAI returned an invalid upload identifier.", body=uploaded.body)
         if uploaded.body.get("sha256") not in {None, hashlib.sha256(content).hexdigest()}:
             raise RemoteError("The upload checksum does not match the local file.", body=uploaded.body)
-        artifacts = ["protected", "entities", *(["mapping"] if mode != "mask" else [])]
+        mapping_artifact = ["mapping"] if mode != "mask" else []
         source: dict[str, Any] = {
             "id": "1",
             "kind": "file",
@@ -381,16 +412,23 @@ class ShinraiClient:
         }
         if language and language != "auto":
             source["language"] = language
-        job_body = {
+        job_body: dict[str, Any] = {
             "kind": "document",
             "inputs": [source],
             "policy": {"preset": PRESETS[mode]},
-            "output": {"artifacts": artifacts},
+            "output": {"artifacts": [*DOCUMENT_ARTIFACTS, *mapping_artifact]},
         }
+        refused: dict[str, Any] | None = None
         try:
-            submitted = await self.request(
-                "POST", "/v2/jobs", json=job_body, headers={"Idempotency-Key": str(uuid.uuid4())}
-            )
+            try:
+                submitted = await self._submit(job_body)
+            except RemoteError as exc:
+                if not refuses_text_artifact(exc):
+                    raise
+                # The deployment created no job and charged nothing: one more submission is safe.
+                refused = {"job": job_body, "response": exc.body}
+                job_body = {**job_body, "output": {"artifacts": [*TEXT_ONLY_DOCUMENT_ARTIFACTS, *mapping_artifact]}}
+                submitted = await self._submit(job_body)
         except RemoteError as exc:
             exc.cleanup = "no job was created; the upload expires on the server after 24 hours"
             raise
@@ -399,28 +437,33 @@ class ShinraiClient:
             raise RemoteError("ShinrAI returned an invalid job identifier.", body=submitted.body)
         path = f"/v2/jobs/{job_id}"
         try:
-            job, files = await self._finished_job(path, artifacts)
+            job, files = await self._finished_job(path, job_body["output"]["artifacts"])
+            protected_text, pdf = document_outputs(files)
+            if protected_text is None and not pdf:
+                raise RemoteError("ShinrAI returned no protected output for the document.", body=job.body)
         except BaseException as exc:
             cleanup = await self._delete_job(path)
             if isinstance(exc, RemoteError):
                 exc.cleanup = cleanup
             raise
-        protected = files["protected"].body
-        if isinstance(protected, bytes):
-            protected = protected.decode("utf-8", errors="replace")
-        entities = files["entities"].body.get("entities") if isinstance(files["entities"].body, dict) else None
+        entities_body = files["entities"].body if "entities" in files else None
+        entities = entities_body.get("entities") if isinstance(entities_body, dict) else None
         mapping = files["mapping"].body if "mapping" in files else {}
         return {
-            "api": "v2",
             "job_id": job_id,
             "job": job.body,
-            "text": protected if isinstance(protected, str) else "",
-            "pdf": b"",
+            "text": protected_text or "",
+            "pdf": pdf,
             "image": b"",
+            "note": "" if pdf else "This deployment returned the protected text without a redacted PDF.",
             "mapping": reversible_pairs(mapping.get("delta") if isinstance(mapping, dict) else []),
             "entities": len(entities) if isinstance(entities, list) else 0,
-            "request": {"upload": uploaded.body, "job": job_body},
-            "response": {"job": job.body, "entities": files["entities"].body},
+            "request": {"upload": uploaded.body, "job": job_body, **({"refused": refused} if refused else {})},
+            "response": {
+                "job": job.body,
+                "entities": entities_view(entities_body),
+                "artifacts": {name: artifact_summary(item) for name, item in files.items()},
+            },
             "elapsed_ms": uploaded.elapsed_ms
             + submitted.elapsed_ms
             + job.elapsed_ms
@@ -429,16 +472,20 @@ class ShinraiClient:
             "cleanup": await self._delete_job(path),
         }
 
+    async def _submit(self, job_body: dict[str, Any]) -> Result:
+        return await self.request("POST", "/v2/jobs", json=job_body, headers={"Idempotency-Key": str(uuid.uuid4())})
+
     async def _finished_job(self, path: str, artifacts: list[str]) -> tuple[Result, dict[str, Result]]:
+        """Poll until the job ends, then download the requested artifacts the job lists."""
         deadline = time.monotonic() + 310
         while time.monotonic() < deadline:
             job = await self.request("GET", path)
             status = job.body.get("status") if isinstance(job.body, dict) else None
             if status == "succeeded":
-                downloads = await asyncio.gather(
-                    *(self.request("GET", f"{path}/artifacts/{name}") for name in artifacts)
-                )
-                return job, dict(zip(artifacts, downloads, strict=True))
+                listed = job.body.get("artifacts")
+                names = [name for name in artifacts if not isinstance(listed, dict) or name in listed]
+                downloads = await asyncio.gather(*(self.request("GET", f"{path}/artifacts/{name}") for name in names))
+                return job, dict(zip(names, downloads, strict=True))
             if status in {"failed", "cancelled"}:
                 raise RemoteError("The document could not be protected completely.", body=job.body)
             await asyncio.sleep(1.0)
@@ -451,73 +498,26 @@ class ShinraiClient:
         except (RemoteError, ValueError):
             return "remote cleanup not confirmed; server retention (24 hours) still applies"
 
-    async def document(
-        self, content: bytes, content_type: str, *, mode: str = "replace", mapping: bool = True
-    ) -> dict[str, Any]:
-        if content_type in {"image/png", "image/jpeg", "image/bmp"}:
-            content, content_type = image_to_pdf(content), "application/pdf"
-        if content_type not in {
-            "text/plain",
-            "application/pdf",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        }:
-            raise ValueError("Upload TXT, PDF, DOCX, PNG, JPEG, or BMP.")
-        if not 0 < len(content) <= 10_000_000:
-            raise ValueError("Files must be between 1 byte and 10 MB.")
-        params = {"mode": mode, "include_mapping": str(mapping and mode == "replace").lower()}
-        submitted = await self.request(
-            "POST",
-            "/v1/documents/jobs",
-            params=params,
-            content=content,
-            headers={"Content-Type": content_type, "Idempotency-Key": str(uuid.uuid4())},
-        )
-        job_id = str(submitted.body.get("id", "")) if isinstance(submitted.body, dict) else ""
-        try:
-            uuid.UUID(job_id)
-        except ValueError:
-            raise RemoteError("ShinrAI returned an invalid document job identifier.") from None
-        path = f"/v1/documents/jobs/{job_id}"
-        deadline = time.monotonic() + 310
-        cleanup = "pending"
-        try:
-            while time.monotonic() < deadline:
-                job = await self.request("GET", path)
-                status = job.body.get("status") if isinstance(job.body, dict) else None
-                if status == "succeeded":
-                    text, pdf = await asyncio.gather(
-                        self.request("GET", path + "/artifacts/text"),
-                        self.request("GET", path + "/artifacts/pdf"),
-                    )
-                    result = {
-                        "api": "v1",
-                        "job_id": job_id,
-                        "job": job.body,
-                        "text": text.body if isinstance(text.body, str) else "",
-                        "pdf": pdf.body if isinstance(pdf.body, bytes) else b"",
-                        "image": b"",
-                        "mapping": {},
-                        "elapsed_ms": submitted.elapsed_ms + job.elapsed_ms + text.elapsed_ms + pdf.elapsed_ms,
-                        "headers": {**submitted.headers, **job.headers},
-                    }
-                    if mapping and mode == "replace":
-                        mapped = await self.request("GET", path + "/artifacts/mapping")
-                        result["mapping"] = mapped.body if isinstance(mapped.body, dict) else {}
-                        result["elapsed_ms"] += mapped.elapsed_ms
-                    return result
-                if status in {"failed", "cancelled"}:
-                    raise RemoteError("The document could not be protected completely.", body=job.body)
-                await asyncio.sleep(0.5)
-            raise RemoteError("Document protection timed out.")
-        finally:
-            try:
-                await self.request("DELETE", path, timeout=15)
-                cleanup = "deleted"
-            except RemoteError:
-                cleanup = "remote cleanup not confirmed; server retention still applies"
-            # A mutable result may have been prepared immediately before finally.
-            if "result" in locals():
-                result["cleanup"] = cleanup
+
+def document_outputs(files: dict[str, Result]) -> tuple[str | None, bytes]:
+    """The protected text and the redacted PDF of a document job.
+
+    `protected` is the redacted PDF when it starts with `%PDF-`. Otherwise the deployment
+    predates the redacted PDF and `protected` holds the protected text.
+    """
+    protected = files["protected"].body if "protected" in files else None
+    pdf = protected if isinstance(protected, bytes) and protected.startswith(b"%PDF-") else b""
+    text = text_of(files["text"].body) if "text" in files else None
+    if text is None and not pdf:
+        text = text_of(protected)
+    return text, pdf
+
+
+def artifact_summary(result: Result) -> dict[str, Any]:
+    """Content type and size of a downloaded artifact; the trace never holds the content."""
+    body = result.body
+    size = len(body) if isinstance(body, bytes) else len(body.encode()) if isinstance(body, str) else None
+    return {"content_type": result.headers.get("content-type", ""), "bytes": size}
 
 
 def response_body(response: httpx.Response) -> Any:
@@ -535,7 +535,8 @@ def response_body(response: httpx.Response) -> Any:
 def safe_schema_routes(schema: Any) -> set[tuple[str, str]]:
     if not isinstance(schema, dict) or not isinstance(schema.get("paths"), dict):
         return set()
-    prefixes = ("/v1/", "/language/", "/text/analytics/", "/providers/aws/", "/v2/")
+    # API v2 and the vendor compatibility APIs; the native v1 routes are not offered.
+    prefixes = ("/v1/azure/", "/v1/google/", "/v1/aws/", "/language/", "/text/analytics/", "/providers/aws/", "/v2/")
     result = set()
     for path, operations in schema["paths"].items():
         if not isinstance(path, str) or not path.startswith(prefixes) or not isinstance(operations, dict):
@@ -572,42 +573,36 @@ def png_bytes(content: bytes) -> bytes:
         raise ValueError("The protected image could not be decoded.") from exc
 
 
-def image_to_pdf(content: bytes) -> bytes:
-    try:
-        with Image.open(io.BytesIO(content)) as source:
-            source.seek(0)
-            image = source.convert("RGB")
-            if image.width * image.height > 8_000_000:
-                raise ValueError("Image exceeds the 8-million-pixel limit.")
-            output = io.BytesIO()
-            image.save(output, format="PDF", resolution=144)
-            return output.getvalue()
-    except (UnidentifiedImageError, OSError) as exc:
-        raise ValueError("The image could not be decoded.") from exc
-
-
 def render_pdf(pdf: bytes, *, max_pages: int = 8) -> list[bytes]:
+    """PNG page previews of a redacted PDF, for the Files view and visual chat."""
     if not pdf:
         return []
     try:
         document = pdfium.PdfDocument(pdf)
+    except Exception as exc:
+        raise ValueError("The redacted PDF could not be read.") from exc
+    try:
         if len(document) > max_pages:
-            raise ValueError(f"Visual chat supports at most {max_pages} pages per attachment.")
+            raise ValueError(
+                f"The redacted PDF has {len(document)} pages. Page previews and visual chat support {max_pages} at most."
+            )
         output: list[bytes] = []
         for page in document:
             bitmap = page.render(scale=1.5)
-            image = bitmap.to_pil()
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG", optimize=True)
-            output.append(buffer.getvalue())
-            bitmap.close()
-            page.close()
-        document.close()
+            try:
+                buffer = io.BytesIO()
+                bitmap.to_pil().save(buffer, format="PNG", optimize=True)
+                output.append(buffer.getvalue())
+            finally:
+                bitmap.close()
+                page.close()
         return output
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError("The protected PDF preview could not be rendered.") from exc
+        raise ValueError("The redacted PDF preview could not be rendered.") from exc
+    finally:
+        document.close()
 
 
 def compact_json(value: Any) -> bytes:

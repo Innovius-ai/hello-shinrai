@@ -5,10 +5,9 @@ from typing import Any
 from .client import vendor_path
 
 V2 = "ShinrAI native API v2"
-V1 = "ShinrAI native v1 (legacy)"
 SAMPLE = "Email Ada Lovelace at ada@example.org. She lives in London."
 
-# The native API v2 comes first; v1 and the vendor compatibility surfaces follow.
+# The native API v2 comes first; the vendor compatibility surfaces follow.
 NATIVE_V2: list[dict[str, Any]] = [
     {
         "id": "v2.detect",
@@ -140,7 +139,7 @@ NATIVE_V2: list[dict[str, Any]] = [
         "path": "/v2/jobs/{job_id}/artifacts/{name}",
         "auth": "bearer",
         "body": None,
-        "requires": "Replace {job_id} and {name} (protected, entities, or mapping)",
+        "requires": "Replace {job_id} and {name} (protected, text, entities, or mapping); use Download response",
     },
     {
         "id": "v2.job-cancel",
@@ -166,60 +165,6 @@ NATIVE_V2: list[dict[str, Any]] = [
 
 OPERATIONS: list[dict[str, Any]] = [
     *NATIVE_V2,
-    {
-        "id": "native.models",
-        "group": V1,
-        "name": "Models and tier access",
-        "method": "GET",
-        "path": "/v1/models",
-        "auth": "bearer",
-        "body": None,
-    },
-    {
-        "id": "native.usage",
-        "group": V1,
-        "name": "Usage and balances",
-        "method": "GET",
-        "path": "/v1/usage",
-        "auth": "bearer",
-        "body": None,
-    },
-    {
-        "id": "native.analyze",
-        "group": V1,
-        "name": "Analyze text",
-        "method": "POST",
-        "path": "/v1/analyze",
-        "auth": "bearer",
-        "body": {"text": "Email Ada at ada@example.org", "model": "shinrai-latest", "tier": "standard"},
-    },
-    {
-        "id": "native.redact",
-        "group": V1,
-        "name": "Protect text",
-        "method": "POST",
-        "path": "/v1/redact",
-        "auth": "bearer",
-        "body": {
-            "text": "Email Ada at ada@example.org",
-            "mode": "replace",
-            "model": "shinrai-latest",
-            "tier": "standard",
-        },
-    },
-    {
-        "id": "native.batch",
-        "group": V1,
-        "name": "Consistent batch protection",
-        "method": "POST",
-        "path": "/v1/redact/batch",
-        "auth": "bearer",
-        "body": {
-            "texts": ["Ada lives in Berlin.", "Email Ada at ada@example.org"],
-            "mode": "replace",
-            "include_mapping": True,
-        },
-    },
     {
         "id": "azure.legacy",
         "group": "Azure Language",
@@ -404,36 +349,6 @@ OPERATIONS: list[dict[str, Any]] = [
 # replace them, then checks that the edited path still matches this catalogue.
 OPERATIONS.extend(
     [
-        {
-            "id": "native.document-poll",
-            "group": V1,
-            "name": "Poll document job",
-            "method": "GET",
-            "path": "/v1/documents/jobs/{identifier}",
-            "auth": "bearer",
-            "body": None,
-            "requires": "Replace {identifier}; submit uploads in the Files workspace",
-        },
-        {
-            "id": "native.document-cancel",
-            "group": V1,
-            "name": "Cancel and delete document job",
-            "method": "DELETE",
-            "path": "/v1/documents/jobs/{identifier}",
-            "auth": "bearer",
-            "body": None,
-            "requires": "Replace {identifier}",
-        },
-        {
-            "id": "native.document-download",
-            "group": V1,
-            "name": "Download document artifact",
-            "method": "GET",
-            "path": "/v1/documents/jobs/{identifier}/artifacts/{kind}",
-            "auth": "bearer",
-            "body": None,
-            "requires": "Replace {identifier} and {kind}; use Download response",
-        },
         {
             "id": "azure.text-poll",
             "group": "Azure Language",

@@ -6,8 +6,9 @@ import pytest
 from PIL import Image
 
 from hello_shinrai import cli, credentials
+from hello_shinrai.app import page_previews
 from hello_shinrai.catalog import BY_ID, OPERATIONS, public_catalog, template_matches
-from hello_shinrai.client import image_to_pdf, render_pdf, safe_schema_routes
+from hello_shinrai.client import render_pdf, safe_schema_routes
 from hello_shinrai.restore import Restorer, restore
 from hello_shinrai.security import sanitize, validate_base_url
 
@@ -50,22 +51,51 @@ def test_openapi_discovery_keeps_only_processing_routes():
     schema = {
         "paths": {
             "/v1/analyze": {"post": {}},
+            "/v1/redact/batch": {"post": {}},
+            "/v1/documents/jobs/{identifier}": {"get": {}},
+            "/v1/usage": {"get": {}},
+            "/v1/azure/language/:analyze-text": {"post": {}},
+            "/v1/google/v2/projects/{project}/content:inspect": {"post": {}},
+            "/v1/aws/": {"post": {}},
+            "/providers/aws/credentials": {"post": {}},
+            "/v2/protect": {"post": {}},
             "/v2/projects/{project}/content:inspect": {"post": {}},
             "/console/account": {"get": {}},
             "/ops/health": {"get": {}},
         }
     }
-    assert safe_schema_routes(schema) == {("POST", "/v1/analyze"), ("POST", "/v2/projects/{project}/content:inspect")}
+    assert safe_schema_routes(schema) == {
+        ("POST", "/v1/azure/language/:analyze-text"),
+        ("POST", "/v1/google/v2/projects/{project}/content:inspect"),
+        ("POST", "/v1/aws/"),
+        ("POST", "/providers/aws/credentials"),
+        ("POST", "/v2/protect"),
+        ("POST", "/v2/projects/{project}/content:inspect"),
+    }
 
 
-def test_image_conversion_produces_renderable_protected_pages():
-    raw = io.BytesIO()
-    Image.new("RGB", (200, 100), "white").save(raw, format="PNG")
-    pdf = image_to_pdf(raw.getvalue())
-    pages = render_pdf(pdf)
-    assert pdf.startswith(b"%PDF")
-    assert len(pages) == 1
-    assert pages[0].startswith(b"\x89PNG")
+def pdf_pages(count: int) -> bytes:
+    images = [Image.new("RGB", (200, 100), "black") for _ in range(count)]
+    output = io.BytesIO()
+    images[0].save(output, format="PDF", resolution=144, save_all=True, append_images=images[1:])
+    return output.getvalue()
+
+
+def test_redacted_pdf_renders_page_previews_up_to_the_page_limit():
+    pages = render_pdf(pdf_pages(2))
+    assert len(pages) == 2 and all(page.startswith(b"\x89PNG") for page in pages)
+    assert Image.open(io.BytesIO(pages[0])).getpixel((10, 10)) == (0, 0, 0)
+    assert render_pdf(b"") == []
+    with pytest.raises(ValueError, match="has 9 pages"):
+        render_pdf(pdf_pages(9))
+    with pytest.raises(ValueError, match="could not be read"):
+        render_pdf(b"%PDF-1.4 not a document")
+    # The upload keeps the redacted PDF; only the previews are skipped.
+    assert page_previews({"image": b"", "pdf": pdf_pages(9)}) == (
+        [],
+        "The redacted PDF has 9 pages. Page previews and visual chat support 8 at most.",
+    )
+    assert page_previews({"image": b"png", "pdf": b""}) == ([b"png"], "")
 
 
 def test_every_explorer_operation_is_unique_and_has_a_reviewable_availability():
@@ -74,10 +104,11 @@ def test_every_explorer_operation_is_unique_and_has_a_reviewable_availability():
     assert all(item["path"].startswith("/") for item in OPERATIONS)
     unverified = public_catalog(set())
     assert {item["availability"] for item in unverified} <= {"catalogued", "not yet verified"}
-    discovered = public_catalog({("GET", "/v1/documents/jobs/{identifier}")})
-    poll = next(item for item in discovered if item["id"] == "native.document-poll")
+    discovered = public_catalog({("GET", "/v2/jobs/{job_id}")})
+    poll = next(item for item in discovered if item["id"] == "v2.job-poll")
     assert poll["availability"] == "available"
-    assert template_matches(poll["path"], "/v1/documents/jobs/42a75838-068b-4ed5-b975-6258eb25c397")
+    assert template_matches(poll["path"], "/v2/jobs/job_7f3a9c")
+    assert not template_matches(poll["path"], "/v1/documents/jobs/42a75838-068b-4ed5-b975-6258eb25c397")
 
 
 def test_occupied_port_and_browser_open_failure_are_clear(monkeypatch, capsys):
@@ -126,12 +157,12 @@ def test_vendor_calls_use_the_v1_vendor_prefix():
     )
     assert vendor_path("/v2/infoTypes") == "/v1/google/v2/infoTypes"
     assert vendor_path("/providers/aws/credentials") == "/v1/aws/providers/aws/credentials"
-    assert vendor_path("/v2/detect") == "/v2/detect" and vendor_path("/v1/analyze") == "/v1/analyze"
+    assert vendor_path("/v2/detect") == "/v2/detect"
     assert vendor_path("/v1/azure/language/:analyze-text") == "/v1/azure/language/:analyze-text"
 
 
 def test_v2_mapping_helpers_keep_the_map_restorable():
-    from hello_shinrai.client import apply_replacements, known_block, merge_pairs, reversible_pairs, v1_model, v2_model
+    from hello_shinrai.client import apply_replacements, known_block, merge_pairs, reversible_pairs, v2_model
 
     delta = [
         {"original": "Ada Lovelace", "replacement": "Grace Palmer", "reversible": True},
@@ -140,7 +171,7 @@ def test_v2_mapping_helpers_keep_the_map_restorable():
         {"original": "Berlin", "replacement": "Berlin", "reversible": True},
     ]
     assert reversible_pairs(delta) == {"Ada Lovelace": "Grace Palmer"}
-    assert reversible_pairs({"Ada": "[PERSON_1]"}) == {"Ada": "[PERSON_1]"}
+    assert reversible_pairs({"Ada": "[PERSON_1]"}) == {}  # only a v2 mapping.delta list is a map
     merged = merge_pairs({"Ada Lovelace": "Grace Palmer"}, [{"original": "Ada Lovelace", "replacement": "Other"}])
     assert merged == {"Ada Lovelace": "Grace Palmer"}
     assert known_block(merged) == {
@@ -157,7 +188,6 @@ def test_v2_mapping_helpers_keep_the_map_restorable():
     # Code-point offsets: an emoji before a span counts as one position.
     assert apply_replacements("🙂 Ada", [{"span": {"start": 2, "end": 5}, "replacement": "Bob"}]) == "🙂 Bob"
     assert v2_model("shinrai-latest") == v2_model("") == "latest" and v2_model("v1.4") == "v1.4"
-    assert v1_model("latest") == "shinrai-latest"
 
 
 def test_v2_trace_view_hides_image_bytes_and_ocr_text_from_safe_export():
@@ -182,10 +212,35 @@ def test_v2_trace_view_hides_image_bytes_and_ocr_text_from_safe_export():
     assert safe["results"][0]["entities"][0]["original"] == "[omitted from safe export]"
 
 
+def test_document_job_outputs_prefer_the_redacted_pdf_and_the_text_artifact():
+    from hello_shinrai.client import RemoteError, Result, document_outputs, refuses_text_artifact
+
+    def result(body):
+        return Result(200, body, {}, 0)
+
+    pdf = pdf_pages(1)
+    assert document_outputs({"protected": result(pdf), "text": result("[PERSON]")}) == ("[PERSON]", pdf)
+    assert document_outputs({"protected": result(pdf)}) == (None, pdf)
+    # Older deployments: `protected` is the protected text; a text body in `protected` is never a PDF.
+    assert document_outputs({"protected": result("[PERSON]")}) == ("[PERSON]", b"")
+    assert document_outputs({"protected": result(b"[PERSON]")}) == ("[PERSON]", b"")
+    assert document_outputs({"protected": result("[A]"), "text": result("[B]")}) == ("[B]", b"")
+    assert document_outputs({}) == (None, b"")
+    refused = {"error": {"details": [{"pointer": "/output/artifacts", "reason": "unknown or repeated artifact"}]}}
+    assert refuses_text_artifact(RemoteError("x", status=422, body=refused))
+    assert refuses_text_artifact(RemoteError("x", status=501, body=refused))
+    assert not refuses_text_artifact(RemoteError("x", status=409, body=refused))
+    assert not refuses_text_artifact(
+        RemoteError("x", status=422, body={"error": {"details": [{"pointer": "/inputs/0/media_type"}]}})
+    )
+    assert not refuses_text_artifact(RemoteError("x", status=422, body="Unprocessable"))
+
+
 def test_catalog_lists_native_v2_first_and_matches_vendor_prefixes():
     assert OPERATIONS[0]["group"] == "ShinrAI native API v2"
     groups = list(dict.fromkeys(item["group"] for item in OPERATIONS))
-    assert groups[:2] == ["ShinrAI native API v2", "ShinrAI native v1 (legacy)"]
+    assert groups[:2] == ["ShinrAI native API v2", "Azure Language"]
+    assert not any(item["path"].startswith("/v1/") or item["id"].startswith("native.") for item in OPERATIONS)
     ids = {item["id"] for item in OPERATIONS if item["group"] == "ShinrAI native API v2"}
     assert {"v2.detect", "v2.protect", "v2.restore", "v2.capabilities", "v2.types", "v2.usage", "v2.job-create"} <= ids
     discovered = public_catalog({("POST", "/v1/google/v2/projects/{project}/locations/{location}/content:inspect")})
