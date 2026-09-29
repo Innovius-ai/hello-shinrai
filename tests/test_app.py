@@ -413,7 +413,8 @@ async def test_connect_refuses_a_deployment_without_api_v2(local, host, status):
     detail = response.json()["detail"]
     assert detail["remote_status"] == status
     assert detail["message"].startswith("This deployment does not serve the ShinrAI API v2")
-    assert f"answered {status}" in detail["message"] and "needs API v2" in detail["message"]
+    assert f"answered {status}" in detail["message"]
+    assert "This version of Hello ShinrAI needs API v2" in detail["message"]
     assert not any(request.url.path.startswith("/v1/") for request in REMOTE_REQUESTS)
     bootstrap = (await client.get("/api/bootstrap", headers=headers)).json()
     assert bootstrap["capabilities"] is None and "native_api" not in bootstrap
@@ -740,6 +741,9 @@ async def test_pdf_document_job_downloads_the_redacted_pdf_artifact_and_renders_
     assert trace["response"]["pages_rendered"] == 1 and "refused" not in trace["shinrai_request"]
     safe = json.dumps((await client.get("/api/traces/export", headers=headers)).json())
     assert "Ada Lovelace" not in safe and "ada@example.org" not in safe
+    assert "customer-secret" not in safe  # the uploaded file name
+    full = json.dumps((await client.get("/api/traces/export?include_sensitive=true", headers=headers)).json())
+    assert "customer-secret.pdf" in full
     response = await client.post(
         "/api/chat",
         headers=headers,

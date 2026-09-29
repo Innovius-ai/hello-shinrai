@@ -36,14 +36,17 @@ def test_safe_export_masks_credentials_signed_urls_and_private_values():
         "Authorization": "Bearer secret-token",
         "mapping": {"Ada": "Person 1"},
         "original_input": "Ada",
+        "original_filename": "Ada_Lovelace_contract.pdf",
         "url": "https://storage.example/file?sv=1&sig=secret&visible=yes",
     }
     safe = sanitize(value)
     assert safe["Authorization"] == "[hidden]"
     assert safe["mapping"] == "[omitted from safe export]"
+    assert safe["original_filename"] == "[omitted from safe export]"
     assert "secret" not in safe["url"]
     full = sanitize(value, include_sensitive=True)
     assert full["mapping"] == {"Ada": "Person 1"}
+    assert full["original_filename"] == "Ada_Lovelace_contract.pdf"
     assert full["Authorization"] == "[hidden]"
 
 

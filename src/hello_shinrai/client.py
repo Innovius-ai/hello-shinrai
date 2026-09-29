@@ -38,7 +38,7 @@ DOCUMENT_ARTIFACTS = ("protected", "text", "entities")
 TEXT_ONLY_DOCUMENT_ARTIFACTS = ("protected", "entities")
 NO_API_V2 = (
     "This deployment does not serve the ShinrAI API v2 (GET /v2/capabilities answered {status}). "
-    "Hello ShinrAI 0.2 needs API v2: use the hosted API or an offline release that serves API v2."
+    "This version of Hello ShinrAI needs API v2: use the hosted API or an offline release that serves API v2."
 )
 
 

@@ -61,6 +61,7 @@ def sanitize(value: Any, *, include_sensitive: bool = False) -> Any:
                 "original_input",
                 "original_inputs",
                 "original_body",
+                "original_filename",
                 "ocr_text",
                 "restored_text",
                 "restored_response",

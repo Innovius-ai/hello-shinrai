@@ -8,6 +8,8 @@ The app binds only to `127.0.0.1`. API keys remain in the local Python process u
 
 ## Run it
 
+This README describes Hello ShinrAI 0.2.0, which is not released yet. The commands below install the current release, 0.1.4. Release 0.1.4 still offers the native API v1 options and falls back to API v1 when a deployment does not serve API v2.
+
 Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) once, then run the tagged release:
 
 ```bash
@@ -101,7 +103,7 @@ After connecting, the app supplements these examples with processing routes from
 
 ## Diagnostics and privacy
 
-The right-side trace records observed request and response bodies, returned headers, local end-to-end timing, server-reported timing when present, first-token time, usage, and cleanup. Credentials are always masked. **Export safe** also removes original content and restoration maps. **Export with private data** requires an explicit browser confirmation.
+The right-side trace records observed request and response bodies, returned headers, local end-to-end timing, server-reported timing when present, first-token time, usage, and cleanup. Credentials are always masked. **Export safe** also removes original content, uploaded file names, and restoration maps. **Export with private data** requires an explicit browser confirmation.
 
 Session traces, attachments, mappings, and chat history are lost when the process stops. **Remember securely** uses macOS Keychain, Windows Credential Locker, or a supported Linux Secret Service. If no recommended credential store is available, the app continues in memory-only mode. Environment variables are also supported:
 
@@ -122,7 +124,7 @@ Session traces, attachments, mappings, and chat history are lost when the proces
 - **Connection failed** means the endpoint could not be reached or authenticated. It is not displayed as a missing tier entitlement.
 - **Real-time · fast says not entitled** means `/v2/capabilities` lists the tier as `not_in_plan` for that key. Select Standard or Batch, or use a key with the required plan or pack.
 - **This deployment does not serve API v2 document jobs** means `/v2/capabilities` lists no `file` jobs. Send text files and images, or use a deployment with document jobs for PDF and DOCX.
-- **This deployment does not serve the ShinrAI API v2** means the deployment answered 404 or 501 for `/v2/capabilities`. Use the hosted API or an offline release that serves API v2.
+- **This deployment does not serve the ShinrAI API v2** means the deployment answered 404 or 501 for `/v2/capabilities`. Use the hosted API or an offline release that serves API v2. With an offline image that serves only API v1, use Hello ShinrAI release 0.1.4.
 - **No redacted PDF for a document** means the deployment returned the protected text only. The text, findings, and replacement map are complete.
 - **Model discovery failed** does not erase a manually entered model. Verify the models URL and key, or continue with the model ID from the provider's documentation.
 - **Image or scan failed** can indicate disabled OCR, an unsupported document feature, low OCR confidence, page/pixel limits, or an unavailable document worker. The remote error appears in the trace.
