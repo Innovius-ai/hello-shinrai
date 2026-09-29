@@ -13,10 +13,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
-from botocore.credentials import Credentials
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -31,6 +28,7 @@ from .client import (
     RemoteError,
     Result,
     ShinraiClient,
+    aws_signed,
     compact_json,
     known_block,
     mapping_delta,
@@ -41,9 +39,15 @@ from .client import (
     v2_options,
     vendor_path,
 )
+from .exports import collection
+from .exports import filename as export_filename
 from .restore import Restorer, restore
 from .security import sanitize, validate_base_url
 from .state import Attachment, RuntimeState
+from .vendor_ports import VENDORS, VendorPortError, VendorPorts, vendor_openapi
+
+Vendor = Literal["azure", "google", "aws"]
+ExportTarget = Literal["auto", "local", "deployment"]
 
 
 class ShinraiSettings(BaseModel):
@@ -108,6 +112,11 @@ class AzureCompare(BaseModel):
     include_real_azure: bool = False
 
 
+class VendorPortsRun(BaseModel):
+    enabled: bool
+    base_port: int | None = Field(default=None, ge=1024, le=65533)
+
+
 class ExplorerRun(BaseModel):
     operation_id: str
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] | None = None
@@ -133,13 +142,22 @@ async def lifespan(app: FastAPI):
         state.connection.llm_key = credentials.read("llm")
     if not state.connection.azure_key:
         state.connection.azure_key = credentials.read("azure")
-    yield
+    ports: VendorPorts = app.state.vendor_ports
+    if app.state.vendor_ports_autostart is not None:
+        await ports.start(app.state.vendor_ports_autostart)
+    try:
+        yield
+    finally:
+        await ports.stop()
 
 
-def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
+def create_app(*, http: httpx.AsyncClient | None = None, vendor_ports: int | None = None) -> FastAPI:
+    """The local workbench. `vendor_ports` starts the vendor endpoints at that first port."""
     app = FastAPI(title="Hello ShinrAI", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.runtime = RuntimeState()
     app.state.http = http
+    app.state.vendor_ports = VendorPorts(app)
+    app.state.vendor_ports_autostart = vendor_ports
     static = files("hello_shinrai").joinpath("static")
     app.mount("/assets", StaticFiles(directory=str(static)), name="assets")
 
@@ -192,6 +210,7 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             },
             "azure": {"endpoint": connection.azure_url, "has_key": bool(connection.azure_key)},
             "secure_storage": credentials.available(),
+            "vendor_ports": app.state.vendor_ports.status(),
             "capabilities": state.capabilities,
             "usage": state.usage,
             "attachments": attachment_views(state),
@@ -208,6 +227,8 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         except (ValueError, RemoteError) as exc:
             trace_error(state, "shinrai.connect", exc, destination=body.base_url)
             raise api_error(exc)
+        if (url, key) != (state.connection.shinrai_url, state.connection.shinrai_key):
+            state.aws_credentials = None  # the issued AWS pair belongs to the previous key and deployment
         state.connection.shinrai_url, state.connection.shinrai_key = url, key
         state.capabilities, state.usage, state.discovered_routes = capabilities.body, usage.body, routes
         saved = keyring_module().write("shinrai", key) if body.remember else False
@@ -541,6 +562,75 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
             "trace": sanitize(trace, include_sensitive=True),
         }
 
+    @app.get("/api/vendor-ports")
+    async def vendor_ports_status():
+        return app.state.vendor_ports.status()
+
+    @app.post("/api/vendor-ports")
+    async def set_vendor_ports(body: VendorPortsRun):
+        ports: VendorPorts = app.state.vendor_ports
+        try:
+            if body.enabled:
+                status = await ports.start(body.base_port or ports.status()["base_port"])
+            else:
+                status = await ports.stop()
+        except VendorPortError as exc:
+            trace_error(app.state.runtime, "vendor.endpoints", exc)
+            raise HTTPException(409, str(exc)) from exc
+        first = status["base_port"]
+        app.state.runtime.traces.insert(
+            0,
+            make_trace(
+                "vendor.endpoints",
+                status="success",
+                destination=f"127.0.0.1 ports {first}-{first + len(VENDORS) - 1}",
+                response={"enabled": status["enabled"]},
+            ),
+        )
+        return status
+
+    @app.get("/api/exports/openapi/{vendor}")
+    async def export_openapi(vendor: Vendor, target: ExportTarget = "auto"):
+        state: RuntimeState = app.state.runtime
+        local = export_target(app, target)
+        client = configured_shinrai(app)
+        try:
+            schema = await client.request("GET", "/openapi.json", timeout=30)
+        except RemoteError as exc:
+            raise api_error(exc) from exc
+        server = app.state.vendor_ports.endpoint(vendor) if local else f"{state.connection.shinrai_url}/v1/{vendor}"
+        try:
+            document = vendor_openapi(schema.body, vendor, server_url=server, local=local)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except TypeError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        suffix = "local" if local else "deployment"
+        return JSONResponse(
+            document, headers={"Content-Disposition": f"attachment; filename=shinrai-{vendor}-{suffix}.openapi.json"}
+        )
+
+    @app.get("/api/exports/collection/{vendor}")
+    async def export_collection(
+        vendor: Vendor,
+        fmt: Literal["http", "curl"] = Query("http", alias="format"),
+        target: ExportTarget = "auto",
+    ):
+        local = export_target(app, target)
+        text = collection(
+            vendor,
+            fmt=fmt,
+            shinrai_url=app.state.runtime.connection.shinrai_url,
+            local_endpoint=app.state.vendor_ports.endpoint(vendor) if local else None,
+            version=__version__,
+        )
+        name = export_filename(vendor, fmt, local)
+        return Response(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={name}"},
+        )
+
     @app.get("/api/traces")
     async def traces():
         return {"traces": [sanitize(item, include_sensitive=True) for item in app.state.runtime.traces]}
@@ -570,6 +660,14 @@ def create_app(*, http: httpx.AsyncClient | None = None) -> FastAPI:
         return {"cleared": True}
 
     return app
+
+
+def export_target(app: FastAPI, target: str) -> bool:
+    """True for the local vendor endpoints; `auto` picks them while they run."""
+    running = app.state.vendor_ports.enabled
+    if target == "local" and not running:
+        raise HTTPException(409, "Start the vendor endpoints first, or export for the deployment.")
+    return running if target == "auto" else target == "local"
 
 
 def text_request(state: RuntimeState, body: TextRun) -> tuple[str, dict[str, Any]]:
@@ -892,30 +990,22 @@ async def explorer_request(app, operation, method, path, query, payload, auth) -
     )
 
 
+async def aws_pair(app) -> dict[str, Any]:
+    """The SigV4 pair ShinrAI issued for the saved key; issued once per key and base URL."""
+    state: RuntimeState = app.state.runtime
+    if not state.aws_credentials:
+        state.aws_credentials = await configured_shinrai(app).aws_credentials()
+    return state.aws_credentials
+
+
 async def aws_request(app, operation, payload) -> Result:
     state: RuntimeState = app.state.runtime
-    client = configured_shinrai(app)
-    if not state.aws_credentials:
-        issued = await client.request("POST", "/providers/aws/credentials")
-        state.aws_credentials = issued.body
-    pair = state.aws_credentials or {}
-    access, secret = pair.get("accessKeyId"), pair.get("secretAccessKey")
-    if not access or not secret:
-        raise RemoteError("ShinrAI did not issue valid AWS SDK credentials.")
+    pair = await aws_pair(app)
     body = compact_json(payload)
-    url = state.connection.shinrai_url + "/v1/aws/"  # SigV4 signs this path; the gateway verifies it
-    request = AWSRequest(
-        method="POST",
-        url=url,
-        data=body,
-        headers={"Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": operation["aws_target"]},
-    )
-    SigV4Auth(Credentials(access, secret), "comprehend", "eu-central-1").add_auth(request)
+    url, headers = aws_signed(state.connection.shinrai_url, pair, operation["aws_target"], body)
     started = time.perf_counter()
     async with http_client(app) as http:
-        response = await http.post(
-            url, content=body, headers=dict(request.headers.items()), timeout=300, follow_redirects=False
-        )
+        response = await http.post(url, content=body, headers=headers, timeout=300, follow_redirects=False)
     result = Result(
         response.status_code,
         response_body(response),

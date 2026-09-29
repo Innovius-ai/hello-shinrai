@@ -1,6 +1,6 @@
 # Hello ShinrAI
 
-Hello ShinrAI is a local playground for learning, testing, and debugging ShinrAI. It gives you a browser workspace for text protection, document and scan handling, protected LLM chat, Azure Language comparisons, and provider-compatible API calls. The request trace shows what ShinrAI received, what the LLM received, and what was restored locally.
+Hello ShinrAI is a local playground for learning, testing, and debugging ShinrAI. It gives you a browser workspace for text protection, document and scan handling, protected LLM chat, Azure Language comparisons, and provider-compatible API calls. Optional local vendor endpoints let unchanged Azure, Google, and AWS SDKs call ShinrAI. The request trace shows what ShinrAI received, what the LLM received, and what was restored locally.
 
 Hello ShinrAI uses the [ShinrAI native PII API v2](https://shinrai.innovius.io/public-docs/pii-api-v2.md). It needs a deployment that serves API v2. Azure compare and the API explorer also call the Azure, Google, and AWS compatibility APIs.
 
@@ -8,18 +8,16 @@ The app binds only to `127.0.0.1`. API keys remain in the local Python process u
 
 ## Run it
 
-This README describes Hello ShinrAI 0.2.0, which is not released yet. The commands below install the current release, 0.1.4. Release 0.1.4 still offers the native API v1 options and falls back to API v1 when a deployment does not serve API v2.
-
 Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) once, then run the tagged release:
 
 ```bash
-uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.4/hello_shinrai-0.1.4-py3-none-any.whl hello-shinrai
+uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.2.0/hello_shinrai-0.2.0-py3-none-any.whl hello-shinrai
 ```
 
 The browser opens at `http://127.0.0.1:8765`. Use another port or skip browser opening when needed:
 
 ```bash
-uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.1.4/hello_shinrai-0.1.4-py3-none-any.whl hello-shinrai --port 8877 --no-browser
+uvx --from https://github.com/Innovius-ai/hello-shinrai/releases/download/v0.2.0/hello_shinrai-0.2.0-py3-none-any.whl hello-shinrai --port 8877 --no-browser
 ```
 
 To upgrade, change both version values in the wheel URL. To run the current development branch, use `uvx --from git+https://github.com/Innovius-ai/hello-shinrai hello-shinrai`.
@@ -45,7 +43,7 @@ docker run --rm -p 127.0.0.1:8765:8765 hello-shinrai
 After a tagged release, the same image is available from GitHub Container Registry:
 
 ```bash
-docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/innovius-ai/hello-shinrai:v0.1.4
+docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/innovius-ai/hello-shinrai:v0.2.0
 ```
 
 ## First request
@@ -101,6 +99,54 @@ The API Explorer lists the native API v2 first: detect, protect, protect with `m
 
 After connecting, the app supplements these examples with processing routes from the deployment's OpenAPI document. Only `/v2`, `/v1/azure`, `/v1/google`, `/v1/aws`, Azure Language, and AWS credential prefixes are accepted. Dashboard, account, OAuth, MCP, and operator routes cannot be called through the explorer.
 
+## Vendor endpoints
+
+Vendor endpoints let unchanged Azure, Google, and AWS SDKs call ShinrAI through this app. Only the endpoint in the SDK changes. The endpoints are off by default.
+
+Start them in **Connections → Vendor endpoints**, or start the app with `hello-shinrai --vendor-ports`. Three listeners open on `127.0.0.1`:
+
+| Port | Vendor API | ShinrAI destination | Credential that the app adds |
+| --- | --- | --- | --- |
+| 8210 | Azure AI Language PII | `<base URL>/v1/azure` | `Ocp-Apim-Subscription-Key` with your ShinrAI key |
+| 8211 | Google Cloud DLP | `<base URL>/v1/google` | `x-goog-api-key` with your ShinrAI key |
+| 8212 | AWS Comprehend PII | `<base URL>/v1/aws/` | A new AWS Signature Version 4 with the key pair that ShinrAI issues for your key |
+
+`--vendor-ports-base 8310` moves the three listeners to ports 8310, 8311, and 8312. Each endpoint URL has a random path, for example `http://127.0.0.1:8210/p/3f9c0a5e71d24b86`. The path changes with every run. Copy the URLs from **Connections**.
+
+The app removes the credentials that the SDK sends, so the SDK can use any placeholder key. For AWS, the app gets the key pair once from `POST /providers/aws/credentials` and signs for region `eu-central-1` and service `comprehend`. Azure `Operation-Location` headers and `nextLink` values point back to the local endpoint, so SDK pollers and pagers work.
+
+```python
+# Azure AI Language (azure-ai-textanalytics)
+client = TextAnalyticsClient("http://127.0.0.1:8210/p/<run path>", AzureKeyCredential("placeholder"))
+
+# Google Cloud DLP (google-cloud-dlp): use the REST transport
+client = dlp_v2.DlpServiceClient(
+    transport="rest", client_options={"api_endpoint": "http://127.0.0.1:8211/p/<run path>", "api_key": "placeholder"}
+)
+
+# AWS Comprehend (boto3)
+comprehend = boto3.client(
+    "comprehend", endpoint_url="http://127.0.0.1:8212/p/<run path>", region_name="eu-central-1",
+    aws_access_key_id="placeholder", aws_secret_access_key="placeholder",
+)
+```
+
+- **While the endpoints run, any program on this computer that has an endpoint URL can use your ShinrAI key.** Stop the endpoints when you do not need them.
+- The listeners accept requests for `127.0.0.1` and `localhost` only. Requests without the path of the run get 404. Requests from web pages (with an `Origin` or `Sec-Fetch-Site` header) are refused, and the responses carry no CORS headers.
+- The listeners speak HTTP/1.1. Google gRPC clients are not supported; use the REST transport.
+- The trace records the method, path, status, time, and vendor headers of each call. It never records request or response bodies.
+- The endpoints stop when the app stops. The setting is never saved. In the Docker image the endpoints listen on the loopback address of the container, so the host cannot reach them.
+
+### Exports
+
+**Connections → Vendor endpoints** also exports each vendor API:
+
+- **OpenAPI**: the vendor operations of the connected deployment's `/openapi.json`, at the vendor's own paths. While the endpoints run, the server is the local endpoint and the document has no security requirements. Otherwise the server is `<base URL>/v1/<vendor>`. A running endpoint also serves this document at `<endpoint>/openapi.json`.
+- **.http**: requests for the VS Code REST Client and the JetBrains HTTP Client. For the deployment, the requests use the `{{SHINRAI_API_KEY}}` variable of your HTTP client environment.
+- **curl**: a shell file with one function per request. For the deployment, it reads the key from the `SHINRAI_API_KEY` environment variable. AWS requests use `curl --aws-sigv4` (curl 8 or later) with the pair from the `aws_credentials` function.
+
+Exports never contain your key.
+
 ## Diagnostics and privacy
 
 The right-side trace records observed request and response bodies, returned headers, local end-to-end timing, server-reported timing when present, first-token time, usage, and cleanup. Credentials are always masked. **Export safe** also removes original content, uploaded file names, and restoration maps. **Export with private data** requires an explicit browser confirmation.
@@ -119,6 +165,8 @@ Session traces, attachments, mappings, and chat history are lost when the proces
 | `AZURE_LANGUAGE_KEY` | Optional real Azure key |
 | `HELLO_SHINRAI_PORT` | Local port |
 
+Command-line options: `--port`, `--no-browser`, `--vendor-ports`, and `--vendor-ports-base` (default 8210).
+
 ## Troubleshooting
 
 - **Connection failed** means the endpoint could not be reached or authenticated. It is not displayed as a missing tier entitlement.
@@ -128,7 +176,9 @@ Session traces, attachments, mappings, and chat history are lost when the proces
 - **No redacted PDF for a document** means the deployment returned the protected text only. The text, findings, and replacement map are complete.
 - **Model discovery failed** does not erase a manually entered model. Verify the models URL and key, or continue with the model ID from the provider's documentation.
 - **Image or scan failed** can indicate disabled OCR, an unsupported document feature, low OCR confidence, page/pixel limits, or an unavailable document worker. The remote error appears in the trace.
-- **Port unavailable** can be fixed with `hello-shinrai --port 8877`.
+- **Port unavailable** can be fixed with `hello-shinrai --port 8877`. For the vendor endpoints, use `--vendor-ports-base 8310` or change **First port** in Connections.
+- **Vendor endpoint answers 404** means the request did not use the endpoint URL of this run, or the path belongs to another vendor. Copy the URL from Connections again after a restart.
+- **Vendor endpoint answers 503** means Hello ShinrAI has no ShinrAI key. Connect ShinrAI first.
 - **Browser did not open**: copy the local URL printed in the terminal. Use `--no-browser` on headless systems.
 - **Local session expired** is recovered automatically after an app restart. If a tab was opened with v0.1.0, reload it once to load the recovery fix.
 

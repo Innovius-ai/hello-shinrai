@@ -12,6 +12,8 @@ import uvicorn
 
 from . import __version__
 
+VENDOR_PORTS = ("Azure", "Google", "AWS")
+
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run the Hello ShinrAI local workbench.")
@@ -19,6 +21,18 @@ def parser() -> argparse.ArgumentParser:
         "--port", type=int, default=int(os.getenv("HELLO_SHINRAI_PORT", "8765")), help="Loopback port (default: 8765)"
     )
     value.add_argument("--no-browser", action="store_true", help="Do not open a browser automatically")
+    value.add_argument(
+        "--vendor-ports",
+        action="store_true",
+        help="Start the local Azure, Google, and AWS endpoints on 127.0.0.1 (off by default)",
+    )
+    value.add_argument(
+        "--vendor-ports-base",
+        type=int,
+        default=8210,
+        metavar="PORT",
+        help="First vendor port: Azure uses it, Google the next, AWS the one after (default: 8210)",
+    )
     value.add_argument("--version", action="version", version=__version__)
     return value
 
@@ -49,6 +63,15 @@ def main(argv: list[str] | None = None):
     args = parser().parse_args(argv)
     if not port_available(args.port):
         parser().error(f"port {args.port} is unavailable; choose another with --port")
+    vendor_ports = None
+    if args.vendor_ports:
+        vendor_ports = args.vendor_ports_base
+        wanted = range(vendor_ports, vendor_ports + len(VENDOR_PORTS))
+        if vendor_ports < 1024 or wanted[-1] > 65535 or args.port in wanted:
+            parser().error("--vendor-ports-base needs three free ports from 1024 to 65535, apart from --port")
+        busy = [port for port in wanted if not port_available(port)]
+        if busy:
+            parser().error(f"vendor port {busy[0]} is unavailable; choose another with --vendor-ports-base")
     url = f"http://127.0.0.1:{args.port}/"
     if not args.no_browser:
         threading.Thread(target=open_browser, args=(url,), daemon=True).start()
@@ -58,7 +81,13 @@ def main(argv: list[str] | None = None):
     host = os.getenv("HELLO_SHINRAI_BIND", "127.0.0.1")
     if host not in {"127.0.0.1", "0.0.0.0"}:
         parser().error("HELLO_SHINRAI_BIND must be 127.0.0.1 or 0.0.0.0")
-    uvicorn.run("hello_shinrai.app:app", host=host, port=args.port, log_level="warning", access_log=False)
+    if vendor_ports is not None:
+        endpoints = ", ".join(f"{name} {vendor_ports + offset}" for offset, name in enumerate(VENDOR_PORTS))
+        print(f"Vendor endpoints listen on 127.0.0.1 ({endpoints}). Copy the endpoint URLs from Connections.")
+    from .app import create_app
+
+    application = create_app(vendor_ports=vendor_ports)
+    uvicorn.run(application, host=host, port=args.port, log_level="warning", access_log=False)
 
 
 if __name__ == "__main__":

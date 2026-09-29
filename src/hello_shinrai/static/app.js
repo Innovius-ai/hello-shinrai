@@ -1,6 +1,6 @@
 let token = document.querySelector('meta[name="hello-shinrai-session"]').content;
 const state = {
-  bootstrap: null, traces: [], attachments: [], catalog: [], routes: [], chatController: null,
+  bootstrap: null, traces: [], attachments: [], catalog: [], routes: [], chatController: null, vendorPorts: null, vendorPoll: null,
   connection: { shinrai: "offline", llm: false, azure: false, modelCount: null },
 };
 const $ = (id) => document.getElementById(id);
@@ -117,6 +117,7 @@ async function bootstrap() {
     modelCount.textContent = Number.isInteger(value.llm.model_count) ? `${value.llm.model_count} models detected` : "Models not loaded";
     modelCount.className = `model-count ${Number.isInteger(value.llm.model_count) ? "loaded" : ""}`;
     renderConnectionStatus();
+    renderVendorPorts(value.vendor_ports);
     renderAttachments();
     await refreshTraces();
   } catch (error) { toast(error.message, true); }
@@ -204,6 +205,54 @@ $("forget-secrets").addEventListener("click", async () => {
   $("shinrai-key").value = $("llm-key").value = $("azure-key").value = "";
   state.connection = { shinrai: "offline", llm: false, azure: false, modelCount: null };
   setModelCount(null); renderConnectionStatus(); toast("Saved and in-memory keys were forgotten.");
+});
+
+const VENDOR_LABELS = { azure: "Azure AI Language", google: "Google Cloud DLP", aws: "AWS Comprehend" };
+function renderVendorPorts(status) {
+  state.vendorPorts = status || null;
+  const on = Boolean(status?.enabled);
+  const toggle = $("vendor-toggle");
+  toggle.textContent = on ? "Stop vendor endpoints" : "Start vendor endpoints";
+  toggle.className = `button ${on ? "danger" : "primary"}`;
+  if (status?.base_port) $("vendor-base-port").value = status.base_port;
+  $("vendor-base-port").disabled = on;
+  setReadiness("vendor-card-status", on ? `On · ports ${status.base_port}–${status.base_port + 2}` : "Off", on ? "online" : "");
+  const rows = on ? Object.entries(status.endpoints).map(([vendor, url]) => {
+    const row = document.createElement("div"); row.className = "endpoint-row";
+    const name = document.createElement("span"); name.textContent = VENDOR_LABELS[vendor] || vendor;
+    const code = document.createElement("code"); code.textContent = url;
+    const copy = document.createElement("button"); copy.type = "button"; copy.className = "button quiet copy-endpoint"; copy.dataset.url = url; copy.textContent = "Copy";
+    row.append(name, code, copy); return row;
+  }) : [];
+  $("vendor-endpoints").replaceChildren(...rows);
+  $("vendor-export-note").textContent = on
+    ? "Exports use the local endpoints and contain no key."
+    : "Exports use the deployment and contain a SHINRAI_API_KEY placeholder, never the key. Start the endpoints to export for them.";
+  clearInterval(state.vendorPoll);
+  // SDK calls arrive outside this page: refresh the trace while the endpoints run.
+  state.vendorPoll = on ? setInterval(() => { if (document.visibilityState === "visible") refreshTraces(true); }, 4000) : null;
+}
+
+$("vendor-toggle").addEventListener("click", async () => {
+  const button = $("vendor-toggle"); const enabled = !state.vendorPorts?.enabled; button.disabled = true;
+  try {
+    const value = await jsonApi("/api/vendor-ports", { method: "POST", json: { enabled, base_port: Number($("vendor-base-port").value) || null } });
+    renderVendorPorts(value); toast(value.enabled ? "Vendor endpoints started on 127.0.0.1." : "Vendor endpoints stopped.");
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; await refreshTraces(); }
+});
+
+$("vendor-endpoints").addEventListener("click", async (event) => {
+  const button = event.target.closest(".copy-endpoint"); if (!button) return;
+  try { await navigator.clipboard.writeText(button.dataset.url); toast("Endpoint copied."); }
+  catch (_) { toast("Copy failed. Select the URL and copy it manually.", true); }
+});
+
+$("vendor-exports").addEventListener("click", async (event) => {
+  const button = event.target.closest(".vendor-export"); if (!button) return;
+  const { vendor, kind } = button.dataset;
+  const path = kind === "openapi" ? `/api/exports/openapi/${vendor}` : `/api/exports/collection/${vendor}?format=${kind}`;
+  try { downloadResponse(await api(path)); } catch (error) { toast(error.message, true); }
 });
 
 $("load-models").addEventListener("click", async () => {
@@ -418,8 +467,13 @@ $("explorer-download").addEventListener("click", async () => {
   } catch (error) { setStatus("explorer-status", error.message, "error"); await refreshTraces(); }
 });
 
-async function refreshTraces() {
-  try { state.traces = (await jsonApi("/api/traces")).traces; renderTraces(); } catch (_) {}
+function traceSignature(traces) { return traces.map((trace) => `${trace.id}:${trace.status}`).join(","); }
+async function refreshTraces(onlyWhenChanged = false) {
+  try {
+    const traces = (await jsonApi("/api/traces")).traces;
+    if (onlyWhenChanged && traceSignature(traces) === traceSignature(state.traces)) return;
+    state.traces = traces; renderTraces();
+  } catch (_) {}
 }
 function renderTraces() {
   $("trace-count").textContent = `${state.traces.length} run${state.traces.length === 1 ? "" : "s"}`;

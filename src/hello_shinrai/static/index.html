@@ -143,6 +143,20 @@
         <summary><span><strong>Optional Azure reference</strong><small>For side-by-side comparisons</small></span><span class="readiness" id="azure-card-status">Not configured</span></summary>
         <form id="azure-settings" class="optional-settings-form"><div class="field-row two"><label>Azure endpoint<input id="azure-url" placeholder="https://your-resource.cognitiveservices.azure.com"></label><label>Azure key<input id="azure-key" type="password" autocomplete="off" placeholder="Use saved key"></label></div><div class="settings-actions"><label class="inline-check"><input id="remember-azure" type="checkbox"> Remember securely</label><button class="button primary" type="submit">Save Azure</button></div></form>
       </details>
+      <details class="surface optional-settings" id="vendor-settings">
+        <summary><span><strong>Vendor endpoints</strong><small>Local Azure, Google, and AWS endpoints for unchanged SDKs</small></span><span class="readiness" id="vendor-card-status">Off</span></summary>
+        <div class="optional-settings-form vendor-settings">
+          <p class="hint">Three listeners on 127.0.0.1 send vendor SDK calls to ShinrAI and add your saved ShinrAI key. SDKs can use any placeholder key. The path in each URL changes with every run. The endpoints stop when the app stops. The trace records method, path, status, and time, never bodies.</p>
+          <div class="vendor-controls"><label>First port<input id="vendor-base-port" type="number" min="1024" max="65533" value="8210"></label><button class="button primary" id="vendor-toggle" type="button">Start vendor endpoints</button></div>
+          <div id="vendor-endpoints" class="vendor-endpoints"></div>
+          <div id="vendor-exports" class="vendor-exports">
+            <p class="hint" id="vendor-export-note">Exports use the deployment. Start the endpoints to export for them.</p>
+            <div class="export-row"><span>Azure AI Language</span><button class="button quiet vendor-export" data-vendor="azure" data-kind="openapi" type="button">OpenAPI</button><button class="button quiet vendor-export" data-vendor="azure" data-kind="http" type="button">.http</button><button class="button quiet vendor-export" data-vendor="azure" data-kind="curl" type="button">curl</button></div>
+            <div class="export-row"><span>Google Cloud DLP</span><button class="button quiet vendor-export" data-vendor="google" data-kind="openapi" type="button">OpenAPI</button><button class="button quiet vendor-export" data-vendor="google" data-kind="http" type="button">.http</button><button class="button quiet vendor-export" data-vendor="google" data-kind="curl" type="button">curl</button></div>
+            <div class="export-row"><span>AWS Comprehend</span><button class="button quiet vendor-export" data-vendor="aws" data-kind="openapi" type="button">OpenAPI</button><button class="button quiet vendor-export" data-vendor="aws" data-kind="http" type="button">.http</button><button class="button quiet vendor-export" data-vendor="aws" data-kind="curl" type="button">curl</button></div>
+          </div>
+        </div>
+      </details>
     </div>
     <div class="dialog-footer"><span id="secure-storage-note"></span><button class="button danger" id="forget-secrets" type="button">Forget all saved keys</button></div>
   </dialog>

@@ -14,11 +14,19 @@ from typing import Any
 
 import httpx
 import pypdfium2 as pdfium
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
 from PIL import Image, UnidentifiedImageError
 
 from .security import validate_base_url
 
 VENDOR_GOOGLE = ("/v2/projects/", "/v2/organizations/", "/v2/locations/", "/v2/infoTypes")
+# AWS Comprehend calls: SigV4 over the /v1/aws/ path of the ShinrAI base with the pair ShinrAI issued.
+AWS_PATH = "/v1/aws/"
+AWS_SERVICE = "comprehend"
+AWS_REGION = "eu-central-1"
+AWS_CONTENT_TYPE = "application/x-amz-json-1.1"
 
 # Native PII API v2 (https://shinrai.innovius.io/public-docs/pii-api-v2.md).
 PRESETS = {"replace": "pseudonymize", "mask": "mask", "label": "label"}
@@ -167,6 +175,21 @@ def text_of(body: Any) -> str | None:
     return body if isinstance(body, str) else None
 
 
+def aws_signed(
+    base: str, pair: dict[str, Any] | None, target: str, body: bytes, content_type: str = AWS_CONTENT_TYPE
+) -> tuple[str, dict[str, str]]:
+    """URL and SigV4 headers for one Comprehend call. The gateway verifies the signed path /v1/aws/."""
+    access, secret = (pair or {}).get("accessKeyId"), (pair or {}).get("secretAccessKey")
+    if not isinstance(access, str) or not isinstance(secret, str) or not access or not secret:
+        raise RemoteError("ShinrAI did not issue valid AWS SDK credentials.")
+    url = base + AWS_PATH
+    request = AWSRequest(
+        method="POST", url=url, data=body, headers={"Content-Type": content_type, "X-Amz-Target": target}
+    )
+    SigV4Auth(Credentials(access, secret), AWS_SERVICE, AWS_REGION).add_auth(request)
+    return url, dict(request.headers.items())
+
+
 def vendor_path(path: str) -> str:
     """Vendor compatibility calls go through /v1/<vendor> on the ShinrAI API host.
 
@@ -292,6 +315,15 @@ class ShinraiClient:
         except (RemoteError, ValueError, TypeError):
             pass
         return capabilities, usage, routes
+
+    async def aws_credentials(self) -> dict[str, str]:
+        """The SigV4 pair ShinrAI issues for this key (POST /providers/aws/credentials)."""
+        issued = await self.request("POST", "/providers/aws/credentials")
+        pair = issued.body if isinstance(issued.body, dict) else {}
+        access, secret = pair.get("accessKeyId"), pair.get("secretAccessKey")
+        if not isinstance(access, str) or not isinstance(secret, str) or not access or not secret:
+            raise RemoteError("ShinrAI did not issue valid AWS SDK credentials.")
+        return {"accessKeyId": access, "secretAccessKey": secret}
 
     async def protect_texts(
         self,

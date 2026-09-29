@@ -103,9 +103,20 @@ dialog::backdrop { background: #02080ed9; backdrop-filter: blur(4px); }
 .optional-settings[open] > summary { border-bottom: 1px solid var(--line); }
 .optional-settings-form { padding: 12px 14px 14px; }
 .optional-settings-form .field-row { margin-bottom: 0; }
+.vendor-settings > .hint { margin: 0 0 10px; }
+.vendor-controls { display: grid; grid-template-columns: 140px auto; gap: 10px; align-items: end; justify-content: start; }
+.vendor-controls .button { min-height: 38px; }
+.vendor-endpoints { display: grid; gap: 6px; margin-top: 10px; }
+.endpoint-row { display: grid; grid-template-columns: 140px minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: .76rem; }
+.endpoint-row code { overflow-wrap: anywhere; color: var(--accent); }
+.endpoint-row .button, .export-row .button { padding: 5px 9px; font-size: .74rem; }
+.vendor-exports { display: grid; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.vendor-exports .hint { margin: 0 0 4px; }
+.export-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: .76rem; }
+.export-row > span { min-width: 140px; color: var(--muted); }
 .dialog-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--muted); margin-top: 10px; font-size: .72rem; }
 #toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; background: var(--accent-soft); color: var(--ink); border: 1px solid #248c92; border-radius: 6px; padding: 11px 14px; transform: translateY(120px); opacity: 0; transition: .2s ease; z-index: 100; }#toast.show { transform: none; opacity: 1; }#toast.error { background: #3b1d1d; border-color: #7c4040; }
 body.debug-collapsed .shell { grid-template-columns: 190px minmax(520px, 1fr) 54px; }body.debug-collapsed .debug-panel > :not(.debug-heading), body.debug-collapsed .debug-heading > div { display: none; }body.debug-collapsed .debug-heading { justify-content: center; }body.debug-collapsed #toggle-debug { transform: rotate(180deg); }
 @media (max-width: 1120px) { .shell { grid-template-columns: 150px minmax(480px, 1fr) 320px; }.rail-item span { display: none; }.workspace { padding: 28px 20px; }.chat-layout { grid-template-columns: 1fr; }.flow-card { order: -1; }.settings-grid { grid-template-columns: 1fr; }.optional-settings { grid-column: auto; } }
 @media (max-width: 850px) { .topbar { height: auto; min-height: 68px; }.brand small { display: none; }.shell, body.debug-collapsed .shell { display: block; }.rail { position: sticky; top: 68px; z-index: 10; flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 8px; }.rail-item { flex: none; padding: 9px 11px; }.rail-note { display: none; }.workspace { padding: 24px 14px 420px; }.debug-panel { position: fixed; left: 0; right: 0; bottom: 0; top: auto; height: 360px; max-height: 45vh; border-left: 0; border-top: 1px solid var(--line); z-index: 15; }.debug-collapsed .debug-panel { height: 48px; }.result-grid, .comparison-grid { grid-template-columns: 1fr; }.field-row.three { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 650px) { .connection-chip { display: none; }.panel-heading { display: block; }.step-badge { display: inline-block; margin-top: 12px; }.field-row.two, .field-row.three { grid-template-columns: 1fr; }.surface { padding: 16px; }.dialog-footer { align-items: stretch; flex-direction: column; }.message { max-width: 94%; }.optional-settings > summary > span:first-child { display: grid; gap: 1px; }.settings-actions { align-items: stretch; flex-direction: column; }.model-status-row { align-items: start; flex-direction: column; } }
+@media (max-width: 650px) { .connection-chip { display: none; }.panel-heading { display: block; }.step-badge { display: inline-block; margin-top: 12px; }.field-row.two, .field-row.three { grid-template-columns: 1fr; }.surface { padding: 16px; }.dialog-footer { align-items: stretch; flex-direction: column; }.message { max-width: 94%; }.optional-settings > summary > span:first-child { display: grid; gap: 1px; }.settings-actions { align-items: stretch; flex-direction: column; }.model-status-row { align-items: start; flex-direction: column; }.endpoint-row, .vendor-controls { grid-template-columns: 1fr; }.endpoint-row .button { justify-self: start; }.export-row > span { flex-basis: 100%; min-width: 0; } }
