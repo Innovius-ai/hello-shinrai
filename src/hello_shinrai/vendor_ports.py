@@ -1,8 +1,8 @@
 """Local vendor endpoints: loopback listeners for unchanged Azure, Google, and AWS SDKs.
 
 The listeners are off by default and are never persisted. They bind 127.0.0.1 only and accept
-requests under a path prefix drawn at random for each run (SDKs accept an endpoint with a path,
-but cannot send a session token). Each request goes to the configured ShinrAI deployment under
+requests under a path prefix drawn at random each time they start (SDKs accept an endpoint with
+a path, but cannot send a session token). Each request goes to the configured ShinrAI deployment under
 /v1/<vendor> with the saved ShinrAI key: Azure receives Ocp-Apim-Subscription-Key, Google
 x-goog-api-key, and AWS a new SigV4 signature with the pair ShinrAI issued for the key. The
 client's own credentials are dropped. Traces keep the method, path, status, time, and vendor
@@ -28,6 +28,8 @@ import httpx
 import uvicorn
 
 from .client import AWS_CONTENT_TYPE, VENDOR_GOOGLE, RemoteError, ShinraiClient, aws_signed
+from .security import validate_base_url
+from .state import RuntimeState
 
 VENDORS = ("azure", "google", "aws")
 VENDOR_NAMES = {"azure": "Azure AI Language PII", "google": "Google Cloud DLP", "aws": "AWS Comprehend PII"}
@@ -69,6 +71,21 @@ AWS_TARGET = re.compile(r"^[A-Za-z0-9_]{1,64}\.[A-Za-z0-9]{1,64}$")
 LINK_KEYS = {"nextLink", "@nextLink"}
 
 
+async def issued_aws_pair(state: RuntimeState, client: ShinraiClient) -> dict[str, str]:
+    """The SigV4 pair that ShinrAI issued for the saved key, requested once per key and base URL.
+
+    Call it right after `client` was built from the saved connection, before any other await.
+    The pair is cached for the connection it was requested for. If a new key or base URL connects
+    during the credential request, the pair signs only the call that requested it.
+    """
+    owner = (state.connection.shinrai_url, state.connection.shinrai_key)
+    pair = state.aws_pair_for(*owner)
+    if pair is None:
+        pair = await client.aws_credentials()
+        state.keep_aws_pair(*owner, pair)
+    return pair
+
+
 class VendorPortError(RuntimeError):
     """The listeners could not start: a port is in use or out of range."""
 
@@ -90,6 +107,25 @@ def vendor_of_path(path: str, method: str, headers: dict[str, str]) -> str | Non
     return None
 
 
+def path_vendor(path: str, item: dict[str, Any]) -> str | None:
+    """The vendor of a root path in an OpenAPI document: the vendor tag, else the path rule.
+
+    The tag rule is the gateway's own rule. It also covers templated paths that the path rule
+    cannot match, for example Google's /v2/{scope}/{resource_id}/inspectTemplates.
+    """
+    tags = {
+        tag
+        for operation in item.values()
+        if isinstance(operation, dict)
+        for tag in operation.get("tags") or []
+        if isinstance(tag, str)
+    }
+    for vendor, tag in VENDOR_TAGS.items():
+        if tag in tags:
+            return vendor
+    return vendor_of_path(path, "POST", {"x-amz-target": "*"})
+
+
 def vendor_openapi(document: Any, vendor: str, *, server_url: str, local: bool) -> dict[str, Any]:
     """One vendor's operations from a deployment's OpenAPI document, at the vendor's own paths.
 
@@ -105,10 +141,14 @@ def vendor_openapi(document: Any, vendor: str, *, server_url: str, local: bool) 
         if not isinstance(path, str) or not isinstance(item, dict):
             continue
         match = PREFIXED.match(path)
-        if match and match.group(1) != vendor:
-            continue
-        own = (match.group(2) or "/") if match else path
-        if vendor_of_path(own, "POST", {"x-amz-target": "*"}) != vendor:
+        if match:
+            # /v1/<vendor> names the vendor, also for templated paths such as /v2/{scope}/{resource_id}/...
+            if match.group(1) != vendor:
+                continue
+            own = match.group(2) or "/"
+        elif path_vendor(path, item) == vendor:
+            own = path
+        else:
             continue
         if local and (vendor == "aws" and own != "/"):
             continue  # the local AWS endpoint signs for the client: no credential route
@@ -314,7 +354,7 @@ def elapsed(started: float) -> int:
 
 
 class VendorPorts:
-    """The three listeners of one app run: 127.0.0.1:<base> Azure, <base+1> Google, <base+2> AWS."""
+    """The three listeners: 127.0.0.1:<base> Azure, <base+1> Google, <base+2> AWS."""
 
     def __init__(self, app):
         self.app = app
@@ -368,6 +408,8 @@ class VendorPorts:
                 raise VendorPortError(
                     f"Port {base_port + len(sockets)} is in use. Choose another first port."
                 ) from None
+            # A new path for every start: URLs captured before a stop do not work after the next start.
+            self.prefix = "/p/" + secrets.token_hex(8)
             self.base_port = self.last_base_port = base_port
             if self.app.state.http is None:
                 self.http = httpx.AsyncClient()
@@ -431,6 +473,7 @@ class VendorPorts:
         return http
 
     def saved(self) -> tuple[str, str]:
+        """The validated base URL and the key of the saved connection."""
         connection = self.app.state.runtime.connection
         if not connection.shinrai_key:
             raise Refused(
@@ -438,7 +481,13 @@ class VendorPorts:
                 "ServiceUnavailable",
                 "Hello ShinrAI has no ShinrAI API key. Connect ShinrAI in Hello ShinrAI first.",
             )
-        return connection.shinrai_url, connection.shinrai_key
+        try:
+            base = validate_base_url(connection.shinrai_url)
+        except ValueError as exc:
+            raise Refused(
+                503, "ServiceUnavailable", f"The ShinrAI base URL is not valid. {exc} Connect ShinrAI again."
+            ) from None
+        return base, connection.shinrai_key
 
     def trace(self, vendor: str, method: str, path: str) -> dict[str, Any]:
         """A trace without bodies: method, path, status, time, and vendor headers."""
@@ -475,11 +524,9 @@ class VendorPorts:
             if query:
                 raise Refused(400, "ValidationException", "The local AWS endpoint accepts no query parameters.")
             trace["request"]["x-amz-target"] = target
-            state = self.app.state.runtime
-            if not state.aws_credentials:
-                state.aws_credentials = await ShinraiClient(base, key, http=self.client()).aws_credentials()
+            pair = await issued_aws_pair(self.app.state.runtime, ShinraiClient(base, key, http=self.client()))
             content_type = headers.get("content-type") or AWS_CONTENT_TYPE
-            url, outgoing = aws_signed(base, state.aws_credentials, target, body, content_type)
+            url, outgoing = aws_signed(base, pair, target, body, content_type)
         else:
             url = f"{base}/v1/{vendor}{rest}" + (f"?{query}" if query else "")
             outgoing = {name: headers[name] for name in FORWARDED_HEADERS[vendor] if name in headers}
@@ -547,5 +594,5 @@ class VendorPorts:
             raise Refused(502, "BadGateway", str(exc)) from None
         except LookupError as exc:
             raise Refused(404, "NotFound", str(exc)) from None
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             raise Refused(502, "BadGateway", str(exc)) from None

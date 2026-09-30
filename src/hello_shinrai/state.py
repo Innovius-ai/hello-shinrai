@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import time
@@ -58,6 +59,8 @@ class RuntimeState:
     llm_model_count: int | None = None
     discovered_routes: set[tuple[str, str]] = field(default_factory=set)
     aws_credentials: dict[str, str] | None = None
+    # The connection the issued AWS pair belongs to: (base URL, SHA-256 of the key).
+    aws_credentials_owner: tuple[str, str] | None = None
     traces: list[dict[str, Any]] = field(default_factory=list)
     attachments: dict[str, Attachment] = field(default_factory=dict)
     chat: Chat = field(default_factory=Chat)
@@ -75,6 +78,17 @@ class RuntimeState:
         self.connection.azure_key = os.getenv("AZURE_LANGUAGE_KEY", "")
         self.connection.azure_url = os.getenv("AZURE_LANGUAGE_ENDPOINT", "")
 
+    def aws_pair_for(self, base_url: str, key: str) -> dict[str, str] | None:
+        """The issued AWS pair if it belongs to this base URL and key."""
+        if self.aws_credentials and self.aws_credentials_owner == credential_owner(base_url, key):
+            return self.aws_credentials
+        return None
+
+    def keep_aws_pair(self, base_url: str, key: str, pair: dict[str, str]) -> None:
+        """Cache a pair issued for (base_url, key), unless another connection was made meanwhile."""
+        if (self.connection.shinrai_url, self.connection.shinrai_key) == (base_url, key):
+            self.aws_credentials, self.aws_credentials_owner = pair, credential_owner(base_url, key)
+
     def trace(self, operation: str, **values: Any) -> dict[str, Any]:
         item = {
             "id": str(uuid.uuid4()),
@@ -89,3 +103,7 @@ class RuntimeState:
 
     def safe_traces(self, include_sensitive: bool = False) -> list[dict[str, Any]]:
         return sanitize(self.traces, include_sensitive=include_sensitive)
+
+
+def credential_owner(base_url: str, key: str) -> tuple[str, str]:
+    return base_url, hashlib.sha256(key.encode()).hexdigest()

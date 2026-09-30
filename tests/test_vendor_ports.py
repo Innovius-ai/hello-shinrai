@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -8,6 +10,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 from urllib.parse import quote
 
 import httpx
@@ -23,8 +26,12 @@ from hello_shinrai.exports import collection
 from hello_shinrai.vendor_ports import vendor_openapi
 
 KEY = "shinrai-secret-7f3a"
+KEY_B = "shinrai-secret-b19c"
 BASE_URL = "https://api.shinrai.example"
 AWS_PAIR = {"accessKeyId": "AKIASYNTHETIC", "secretAccessKey": "synthetic-signing-secret"}
+AWS_PAIR_B = {"accessKeyId": "AKIASYNTHETICB", "secretAccessKey": "synthetic-signing-secret-b"}
+AWS_PAIRS = {KEY: AWS_PAIR, KEY_B: AWS_PAIR_B}
+CREDENTIALS = "/v1/aws/providers/aws/credentials"
 ORIGINAL = "Ada Lovelace"
 UPSTREAM: list[httpx.Request] = []
 PREFIX = re.compile(r"^http://127\.0\.0\.1:(\d+)(/p/[0-9a-f]{16})$")
@@ -50,6 +57,11 @@ OPENAPI = {
         "/v1/google/v2/projects/{project}/locations/{location}/content:inspect": {
             "post": {"tags": ["Google compatibility"], "security": [{"GoogleApiKey": []}]}
         },
+        # Templated scope: the path rule cannot match it, the /v1/google prefix and the tag do.
+        "/v1/google/v2/{scope}/{resource_id}/inspectTemplates": {
+            "get": {"tags": ["Google compatibility"], "security": [{"GoogleApiKey": []}]},
+            "post": {"tags": ["Google compatibility"], "security": [{"GoogleApiKey": []}]},
+        },
         "/v1/aws": {"post": {"tags": ["AWS compatibility"], "security": [{"AWSAccessKeyId": []}]}},
         "/v1/aws/providers/aws/credentials": {"post": {"tags": ["AWS compatibility"]}},
     },
@@ -69,9 +81,11 @@ def upstream(request: httpx.Request) -> httpx.Response:
     cors = {"access-control-allow-origin": "*", "x-request-id": "r-1"}
     if path == "/openapi.json":
         return httpx.Response(200, json=OPENAPI)
-    if path == "/v1/aws/providers/aws/credentials":
-        assert request.headers["authorization"] == "Bearer " + KEY
-        return httpx.Response(200, json=AWS_PAIR)
+    if path in {"/v2/capabilities", "/v2/usage"}:
+        return httpx.Response(200, json={})
+    if path == CREDENTIALS:
+        # The pair that the gateway issues for the bearer key.
+        return httpx.Response(200, json=AWS_PAIRS[request.headers["authorization"].removeprefix("Bearer ")])
     if path == "/v1/aws/":
         return httpx.Response(
             200,
@@ -127,11 +141,11 @@ def free_base() -> int:
     raise RuntimeError("no free loopback ports")
 
 
-@pytest.fixture
-async def workbench(monkeypatch):
+@contextlib.asynccontextmanager
+async def running(monkeypatch, handler=upstream):
     UPSTREAM.clear()
     monkeypatch.setattr(app_module, "keyring_module", lambda: NoKeyring)
-    remote = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    remote = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(http=remote)
     async with app.router.lifespan_context(app):
         app.state.runtime.connection.shinrai_url = BASE_URL
@@ -140,6 +154,12 @@ async def workbench(monkeypatch):
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as local:
             yield app, local, {"X-Hello-Shinrai-Session": app.state.runtime.token}
     await remote.aclose()
+
+
+@pytest.fixture
+async def workbench(monkeypatch):
+    async with running(monkeypatch) as value:
+        yield value
 
 
 async def start(local, headers) -> dict:
@@ -154,6 +174,40 @@ async def start(local, headers) -> dict:
 
 def sdk_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(trust_env=False, timeout=10)
+
+
+async def aws_call(sdk: httpx.AsyncClient, endpoint: str) -> httpx.Response:
+    """A Comprehend call as an AWS SDK sends it: signed with a placeholder pair for the local endpoint."""
+    payload = json.dumps({"Text": "x", "LanguageCode": "en"}).encode()
+    request = AWSRequest(
+        method="POST",
+        url=endpoint,
+        data=payload,
+        headers={"Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": "Comprehend_20171127.DetectPiiEntities"},
+    )
+    SigV4Auth(Credentials("placeholder", "placeholder"), "comprehend", "us-east-1").add_auth(request)
+    response = await sdk.post(endpoint, content=payload, headers=dict(request.headers.items()))
+    assert response.status_code == 200, response.text
+    return response
+
+
+async def connect(local, headers, key: str) -> None:
+    response = await local.post("/api/settings/shinrai", headers=headers, json={"base_url": BASE_URL, "api_key": key})
+    assert response.status_code == 200, response.text
+
+
+def signing_keys() -> list[str]:
+    """The access key ID of each forwarded Comprehend call, after the signature was verified."""
+    ids = []
+    for call in (item for item in UPSTREAM if item.url.path == "/v1/aws/"):
+        access = call.headers["authorization"].split("Credential=", 1)[1].split("/", 1)[0]
+        pair = next(pair for pair in AWS_PAIRS.values() if pair["accessKeyId"] == access)
+        ids.append(verify_sigv4(call, pair["secretAccessKey"])["access"])
+    return ids
+
+
+def issued_for() -> list[str]:
+    return [item.headers["authorization"] for item in UPSTREAM if item.url.path == CREDENTIALS]
 
 
 def verify_sigv4(request: httpx.Request, secret: str) -> dict[str, str]:
@@ -229,6 +283,18 @@ async def test_vendor_endpoints_are_off_by_default_and_loopback_only(workbench):
         with pytest.raises(httpx.TransportError):
             await sdk.post(endpoint + "/language/:analyze-text", json=body)
 
+    # Each start draws a new path: a URL captured before the stop does not work after the next start.
+    again = await local.post("/api/vendor-ports", headers=headers, json={"enabled": True, "base_port": base})
+    if again.status_code == 409 and sys.platform == "win32":
+        again = await local.post("/api/vendor-ports", headers=headers, json={"enabled": True, "base_port": free_base()})
+    assert again.status_code == 200, again.text
+    renewed = again.json()["endpoints"]["azure"]
+    assert PREFIX.fullmatch(renewed).group(2) != PREFIX.fullmatch(endpoint).group(2)
+    if again.json()["base_port"] == base:
+        async with sdk_client() as sdk:
+            assert (await sdk.post(endpoint + "/language/:analyze-text", json=body)).status_code == 404
+            assert (await sdk.post(renewed + "/language/:analyze-text", json=body)).status_code == 200
+
 
 @pytest.mark.asyncio
 async def test_cli_flag_starts_the_endpoints_with_the_app_and_stops_them_with_it(monkeypatch):
@@ -241,6 +307,46 @@ async def test_cli_flag_starts_the_endpoints_with_the_app_and_stops_them_with_it
     assert app.state.vendor_ports.enabled is False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", base))  # the port is free again
+
+
+def test_cli_main_passes_the_vendor_ports_to_the_app_and_checks_them(monkeypatch, capsys):
+    monkeypatch.delenv("HELLO_SHINRAI_BIND", raising=False)
+    started: list[dict] = []
+    monkeypatch.setattr(
+        cli.uvicorn, "run", lambda application, **options: started.append({"app": application, **options})
+    )
+    base = free_base()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    if base <= port <= base + 2:
+        port = base + 3 if cli.port_available(base + 3) else base - 1
+
+    cli.main(["--no-browser", "--vendor-ports", "--vendor-ports-base", str(base), "--port", str(port)])
+    cli.main(["--no-browser", "--port", str(port)])
+    assert [run["app"].state.vendor_ports_autostart for run in started] == [base, None]
+    assert all(run["port"] == port and run["host"] == "127.0.0.1" for run in started)
+    assert f"Azure {base}, Google {base + 1}, AWS {base + 2}" in capsys.readouterr().out
+
+    refused = [
+        ["--vendor-ports-base", "80"],  # below 1024
+        ["--vendor-ports-base", "65534"],  # AWS would need 65536
+        ["--vendor-ports-base", str(base), "--port", str(base + 1)],  # overlaps --port
+    ]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+        busy.bind(("127.0.0.1", base + 2))
+        busy.listen()
+        refused.append(["--vendor-ports-base", str(base)])
+        for argv in refused:
+            if "--port" not in argv:
+                argv += ["--port", str(port)]
+            with pytest.raises(SystemExit) as stopped:
+                cli.main(["--no-browser", "--vendor-ports", *argv])
+            assert stopped.value.code == 2
+    errors = capsys.readouterr().err
+    assert errors.count("--vendor-ports-base needs three free ports") == 3
+    assert f"vendor port {base + 2} is unavailable" in errors
+    assert len(started) == 2
 
 
 @pytest.mark.asyncio
@@ -297,33 +403,80 @@ async def test_google_is_forwarded_with_x_goog_api_key(workbench):
 async def test_aws_is_re_signed_with_the_issued_pair(workbench):
     _, local, headers = workbench
     endpoint = (await start(local, headers))["endpoints"]["aws"]
-    payload = json.dumps({"Text": "x", "LanguageCode": "en"}).encode()
     async with sdk_client() as sdk:
         for _ in range(2):
-            # As an AWS SDK sends it: signed with a placeholder pair for the local endpoint.
-            request = AWSRequest(
-                method="POST",
-                url=endpoint,
-                data=payload,
-                headers={
-                    "Content-Type": "application/x-amz-json-1.1",
-                    "X-Amz-Target": "Comprehend_20171127.DetectPiiEntities",
-                },
-            )
-            SigV4Auth(Credentials("placeholder", "placeholder"), "comprehend", "us-east-1").add_auth(request)
-            response = await sdk.post(endpoint, content=payload, headers=dict(request.headers.items()))
-            assert response.status_code == 200
+            response = await aws_call(sdk, endpoint)
             assert response.headers["x-amzn-requestid"] == "aws-1"
         credentials = await sdk.post(endpoint + "/providers/aws/credentials", json={})
     assert credentials.status_code == 404
-    issued = [item for item in UPSTREAM if item.url.path == "/v1/aws/providers/aws/credentials"]
+    assert issued_for() == ["Bearer " + KEY]
     calls = [item for item in UPSTREAM if item.url.path == "/v1/aws/"]
-    assert len(issued) == 1 and len(calls) == 2
+    assert len(calls) == 2
     for call in calls:
-        assert call.content == payload
+        assert call.content == response.request.content
         assert call.headers["x-amz-target"] == "Comprehend_20171127.DetectPiiEntities"
         scope = verify_sigv4(call, AWS_PAIR["secretAccessKey"])
         assert scope == {"access": "AKIASYNTHETIC", "region": "eu-central-1", "service": "comprehend"}
+
+
+@pytest.mark.asyncio
+async def test_a_new_key_gets_its_own_aws_pair_and_the_same_key_keeps_it(workbench):
+    _, local, headers = workbench
+    endpoint = (await start(local, headers))["endpoints"]["aws"]
+    explorer = {"operation_id": "aws.detect"}
+    async with sdk_client() as sdk:
+        await aws_call(sdk, endpoint)
+        await connect(local, headers, KEY)  # the same base URL and key keep the pair
+        await aws_call(sdk, endpoint)
+        await connect(local, headers, KEY_B)
+        await aws_call(sdk, endpoint)
+        assert (await local.post("/api/explorer/run", headers=headers, json=explorer)).status_code == 200
+    assert issued_for() == ["Bearer " + KEY, "Bearer " + KEY_B]
+    a, b = AWS_PAIR["accessKeyId"], AWS_PAIR_B["accessKeyId"]
+    assert signing_keys() == [a, a, b, b]
+
+
+@pytest.mark.asyncio
+async def test_a_key_connected_during_the_credential_request_does_not_get_the_old_pair(monkeypatch):
+    arrived, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow_credentials(request: httpx.Request) -> httpx.Response:
+        if request.url.path == CREDENTIALS and request.headers["authorization"] == "Bearer " + KEY:
+            arrived.set()
+            await gate.wait()
+        return upstream(request)
+
+    async with running(monkeypatch, slow_credentials) as (app, local, headers):
+        endpoint = (await start(local, headers))["endpoints"]["aws"]
+        async with sdk_client() as sdk:
+            pending = asyncio.create_task(aws_call(sdk, endpoint))
+            await asyncio.wait_for(arrived.wait(), 10)
+            await connect(local, headers, KEY_B)
+            gate.set()
+            await pending  # signed with the pair of the key that made the call
+            await aws_call(sdk, endpoint)
+        state = app.state.runtime
+        assert state.aws_credentials == AWS_PAIR_B and state.connection.shinrai_key == KEY_B
+    assert issued_for() == ["Bearer " + KEY, "Bearer " + KEY_B]
+    assert signing_keys() == [AWS_PAIR["accessKeyId"], AWS_PAIR_B["accessKeyId"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["ftp://bad.example", "http://api.shinrai.example"])
+async def test_an_invalid_base_url_is_refused_before_the_key_is_sent(workbench, base_url):
+    app, local, headers = workbench
+    endpoints = (await start(local, headers))["endpoints"]
+    # For example an unchecked SHINRAI_BASE_URL: the key never goes to it, and nothing answers 500.
+    app.state.runtime.connection.shinrai_url = base_url
+    async with sdk_client() as sdk:
+        answers = [
+            await sdk.get(endpoints["azure"] + "/openapi.json"),
+            await sdk.post(endpoints["azure"] + "/language/:analyze-text", json={}),
+            await sdk.post(endpoints["google"] + "/v2/projects/p/locations/global/content:inspect", json={}),
+        ]
+    assert [answer.status_code for answer in answers] == [503, 503, 503]
+    assert "base URL is not valid" in answers[0].json()["error"]["message"]
+    assert UPSTREAM == []
 
 
 @pytest.mark.asyncio
@@ -401,7 +554,14 @@ async def test_exports_contain_placeholders_never_the_key(workbench):
     assert "securitySchemes" not in local_aws["components"]
     async with sdk_client() as sdk:
         served = (await sdk.get(status["endpoints"]["google"] + "/openapi.json")).json()
-    assert list(served["paths"]) == ["/v2/projects/{project}/locations/{location}/content:inspect"]
+    assert list(served["paths"]) == [
+        "/v2/projects/{project}/locations/{location}/content:inspect",
+        "/v2/{scope}/{resource_id}/inspectTemplates",
+    ]
+    assert all(
+        "security" not in operation
+        for operation in served["paths"]["/v2/{scope}/{resource_id}/inspectTemplates"].values()
+    )
 
     outputs = []
     for vendor in ("azure", "google", "aws"):
@@ -428,7 +588,10 @@ def test_vendor_openapi_accepts_prefixed_and_root_vendor_paths():
         "paths": {
             "/language/:analyze-text": {"post": {}},
             "/v2/projects/{project}/locations/{location}/content:inspect": {"post": {}},
+            # An offline document at the root: the tag names the vendor of a templated path.
+            "/v2/{scope}/{resource_id}/inspectTemplates": {"get": {"tags": ["Google compatibility"]}, "post": {}},
             "/v2/detect": {"post": {}},
+            "/v2/{job_id}/untagged": {"get": {"tags": ["Native PII API v2"]}},
             "/": {"post": {}},
             "/providers/aws/credentials": {"post": {}},
         },
@@ -436,7 +599,10 @@ def test_vendor_openapi_accepts_prefixed_and_root_vendor_paths():
     }
     for document in (OPENAPI, root):
         google = vendor_openapi(document, "google", server_url="https://api.example/v1/google", local=False)
-        assert list(google["paths"]) == ["/v2/projects/{project}/locations/{location}/content:inspect"]
+        assert list(google["paths"]) == [
+            "/v2/projects/{project}/locations/{location}/content:inspect",
+            "/v2/{scope}/{resource_id}/inspectTemplates",
+        ]
         aws = vendor_openapi(document, "aws", server_url="https://api.example/v1/aws", local=False)
         assert set(aws["paths"]) == {"/", "/providers/aws/credentials"}
     with pytest.raises(LookupError):

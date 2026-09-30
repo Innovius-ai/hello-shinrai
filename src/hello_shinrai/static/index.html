@@ -146,7 +146,7 @@
       <details class="surface optional-settings" id="vendor-settings">
         <summary><span><strong>Vendor endpoints</strong><small>Local Azure, Google, and AWS endpoints for unchanged SDKs</small></span><span class="readiness" id="vendor-card-status">Off</span></summary>
         <div class="optional-settings-form vendor-settings">
-          <p class="hint">Three listeners on 127.0.0.1 send vendor SDK calls to ShinrAI and add your saved ShinrAI key. SDKs can use any placeholder key. The path in each URL changes with every run. The endpoints stop when the app stops. The trace records method, path, status, and time, never bodies.</p>
+          <p class="hint">Three listeners on 127.0.0.1 send vendor SDK calls to ShinrAI and add your saved ShinrAI key. SDKs can use any placeholder key. The path in each URL changes each time the endpoints start. The endpoints stop when the app stops. The trace records method, path, status, and time, never bodies.</p>
           <div class="vendor-controls"><label>First port<input id="vendor-base-port" type="number" min="1024" max="65533" value="8210"></label><button class="button primary" id="vendor-toggle" type="button">Start vendor endpoints</button></div>
           <div id="vendor-endpoints" class="vendor-endpoints"></div>
           <div id="vendor-exports" class="vendor-exports">

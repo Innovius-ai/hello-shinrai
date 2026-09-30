@@ -47,6 +47,8 @@ async function renewLocalSession() {
     token = fresh;
     document.querySelector('meta[name="hello-shinrai-session"]').content = fresh;
     toast("Local session renewed after the app restarted.");
+    // The restarted app has other vendor endpoints (or none): the card must not keep the old URLs.
+    setTimeout(refreshVendorPorts, 0);
     return true;
   } catch (_) { return false; }
 }
@@ -68,7 +70,7 @@ function selectTab(name) {
 }
 
 document.querySelectorAll(".rail-item").forEach((node) => node.addEventListener("click", () => selectTab(node.dataset.tab)));
-$("open-settings").addEventListener("click", () => $("settings-dialog").showModal());
+$("open-settings").addEventListener("click", () => { $("settings-dialog").showModal(); refreshVendorPorts(); });
 $("toggle-debug").addEventListener("click", () => document.body.classList.toggle("debug-collapsed"));
 
 function providerDefaults(provider, protocol = "chat") {
@@ -231,6 +233,11 @@ function renderVendorPorts(status) {
   clearInterval(state.vendorPoll);
   // SDK calls arrive outside this page: refresh the trace while the endpoints run.
   state.vendorPoll = on ? setInterval(() => { if (document.visibilityState === "visible") refreshTraces(true); }, 4000) : null;
+}
+
+async function refreshVendorPorts() {
+  // No second session renewal from here: a failed refresh leaves the card as it is.
+  try { renderVendorPorts(await jsonApi("/api/vendor-ports", { _sessionRetry: true })); } catch (_) {}
 }
 
 $("vendor-toggle").addEventListener("click", async () => {

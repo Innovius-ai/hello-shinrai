@@ -41,7 +41,8 @@ def port_available(port: int) -> bool:
     if not 1 <= port <= 65535:
         return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform != "win32":  # on Windows, SO_REUSEADDR lets the probe bind a port that is in use
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(("127.0.0.1", port))
             return True

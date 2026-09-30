@@ -44,7 +44,7 @@ from .exports import filename as export_filename
 from .restore import Restorer, restore
 from .security import sanitize, validate_base_url
 from .state import Attachment, RuntimeState
-from .vendor_ports import VENDORS, VendorPortError, VendorPorts, vendor_openapi
+from .vendor_ports import VENDORS, VendorPortError, VendorPorts, issued_aws_pair, vendor_openapi
 
 Vendor = Literal["azure", "google", "aws"]
 ExportTarget = Literal["auto", "local", "deployment"]
@@ -228,7 +228,8 @@ def create_app(*, http: httpx.AsyncClient | None = None, vendor_ports: int | Non
             trace_error(state, "shinrai.connect", exc, destination=body.base_url)
             raise api_error(exc)
         if (url, key) != (state.connection.shinrai_url, state.connection.shinrai_key):
-            state.aws_credentials = None  # the issued AWS pair belongs to the previous key and deployment
+            # The issued AWS pair belongs to the previous key and deployment.
+            state.aws_credentials = state.aws_credentials_owner = None
         state.connection.shinrai_url, state.connection.shinrai_key = url, key
         state.capabilities, state.usage, state.discovered_routes = capabilities.body, usage.body, routes
         saved = keyring_module().write("shinrai", key) if body.remember else False
@@ -287,7 +288,7 @@ def create_app(*, http: httpx.AsyncClient | None = None, vendor_ports: int | Non
         state.connection.shinrai_key = ""
         state.connection.llm_key = ""
         state.connection.azure_key = ""
-        state.aws_credentials = None
+        state.aws_credentials = state.aws_credentials_owner = None
         state.llm_model_count = None
         return {"forgotten": True}
 
@@ -591,14 +592,13 @@ def create_app(*, http: httpx.AsyncClient | None = None, vendor_ports: int | Non
 
     @app.get("/api/exports/openapi/{vendor}")
     async def export_openapi(vendor: Vendor, target: ExportTarget = "auto"):
-        state: RuntimeState = app.state.runtime
         local = export_target(app, target)
         client = configured_shinrai(app)
+        server = app.state.vendor_ports.endpoint(vendor) if local else f"{client.base}/v1/{vendor}"
         try:
             schema = await client.request("GET", "/openapi.json", timeout=30)
         except RemoteError as exc:
             raise api_error(exc) from exc
-        server = app.state.vendor_ports.endpoint(vendor) if local else f"{state.connection.shinrai_url}/v1/{vendor}"
         try:
             document = vendor_openapi(schema.body, vendor, server_url=server, local=local)
         except LookupError as exc:
@@ -990,19 +990,12 @@ async def explorer_request(app, operation, method, path, query, payload, auth) -
     )
 
 
-async def aws_pair(app) -> dict[str, Any]:
-    """The SigV4 pair ShinrAI issued for the saved key; issued once per key and base URL."""
-    state: RuntimeState = app.state.runtime
-    if not state.aws_credentials:
-        state.aws_credentials = await configured_shinrai(app).aws_credentials()
-    return state.aws_credentials
-
-
 async def aws_request(app, operation, payload) -> Result:
-    state: RuntimeState = app.state.runtime
-    pair = await aws_pair(app)
+    client = configured_shinrai(app)
+    # The base URL and the pair belong to the connection of this call, also if a new key connects meanwhile.
+    pair = await issued_aws_pair(app.state.runtime, client)
     body = compact_json(payload)
-    url, headers = aws_signed(state.connection.shinrai_url, pair, operation["aws_target"], body)
+    url, headers = aws_signed(client.base, pair, operation["aws_target"], body)
     started = time.perf_counter()
     async with http_client(app) as http:
         response = await http.post(url, content=body, headers=headers, timeout=300, follow_redirects=False)

@@ -126,7 +126,11 @@ def curl_collection(vendor: str, *, shinrai_url: str, local_endpoint: str | None
         "# Functions for paths with placeholders take the values as arguments, in path order.",
     ]
     if not local:
-        lines.append("# The key comes from the SHINRAI_API_KEY environment variable. This file does not contain it.")
+        lines += [
+            "# The key comes from the SHINRAI_API_KEY environment variable. This file does not contain it.",
+            "# curl gets the key as a command-line argument. Other users of a shared computer can see it",
+            "# in the process list while a call runs.",
+        ]
         if vendor == "aws":
             lines += [
                 "# Comprehend calls need curl 8 or later (--aws-sigv4). Run aws_credentials once, then set",
