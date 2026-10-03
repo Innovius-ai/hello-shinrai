@@ -48,7 +48,7 @@ from .state import Attachment, RuntimeState
 
 
 class ShinraiSettings(BaseModel):
-    base_url: str = "https://api.shinrai.innovius.io"
+    base_url: str = "https://api.getshinrai.com"
     api_key: str = ""
     remember: bool = False
 

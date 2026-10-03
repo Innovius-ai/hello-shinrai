@@ -39,8 +39,9 @@ test = ["pytest>=8.3,<10", "pytest-asyncio>=0.25,<2"]
 hello-shinrai = "hello_shinrai.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/Innovius-ai/hello-shinrai"
-Documentation = "https://shinrai.innovius.io/docs#hello-shinrai"
+Homepage = "https://getshinrai.com"
+Documentation = "https://getshinrai.com/docs#hello-shinrai"
+Source = "https://github.com/Innovius-ai/hello-shinrai"
 Issues = "https://github.com/Innovius-ai/hello-shinrai/issues"
 
 [tool.hatch.build.targets.wheel]
