@@ -12,7 +12,7 @@ from .security import sanitize
 
 @dataclass
 class Connection:
-    shinrai_url: str = "https://api.shinrai.innovius.io"
+    shinrai_url: str = "https://api.getshinrai.com"
     shinrai_key: str = ""
     llm_provider: str = "innovius"
     llm_models_url: str = "https://api.innovius.ai/v1/models"

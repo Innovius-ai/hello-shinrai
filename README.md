@@ -2,7 +2,9 @@
 
 Hello ShinrAI is a local playground for learning, testing, and debugging ShinrAI. It gives you a browser workspace for text protection, document and scan handling, protected LLM chat, Azure Language comparisons, and provider-compatible API calls. The request trace shows what ShinrAI received, what the LLM received, and what was restored locally.
 
-Hello ShinrAI uses the [ShinrAI native PII API v2](https://shinrai.innovius.io/public-docs/pii-api-v2.md) by default. The v1 routes stay available as a visible option in Text and Files.
+ShinrAI is the PII detection and pseudonymisation API at [getshinrai.com](https://getshinrai.com/). Get an API key in the [ShinrAI console](https://getshinrai.com/console), and see the [Hello ShinrAI guide](https://getshinrai.com/docs#hello-shinrai) in the ShinrAI documentation.
+
+Hello ShinrAI uses the [ShinrAI native PII API v2](https://getshinrai.com/public-docs/pii-api-v2.md) by default. The v1 routes stay available as a visible option in Text and Files.
 
 The app binds only to `127.0.0.1`. API keys remain in the local Python process unless you explicitly save them in your operating system's credential store. There is no database, frontend build, or local model download.
 
@@ -48,7 +50,7 @@ docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/innovius-ai/hello-shinrai:v0.1.4
 
 ## First request
 
-1. Open **Connections** and enter your ShinrAI API key. The managed base URL defaults to `https://api.shinrai.innovius.io` and can be changed for sandbox or on-premises deployments.
+1. Open **Connections** and enter your ShinrAI API key. The managed base URL defaults to `https://api.getshinrai.com` and can be changed for sandbox or on-premises deployments.
 2. Connect. Hello ShinrAI reads `GET /v2/capabilities` and `GET /v2/usage`, then shows available models, balance, and Standard, Batch, and Real-time access. Real-time is labelled as the fast tier. A deployment without API v2 answers 404; the app then reads `/v1/models` and `/v1/usage` and switches Text and Files to v1.
 3. Open **Text**, keep the supplied synthetic example, and run protection.
 4. Expand the trace on the right to inspect the request, response, request IDs, timing, findings, mapping, and usage.
